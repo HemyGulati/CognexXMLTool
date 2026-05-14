@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+.venv/
+venv/
+env/
+
+# PyInstaller
+build/
+dist/
+*.spec
+
+# Local app config
+cognex_xml_tool_config.json
+
+# Tool outputs
+output/*.csv
+output/*.txt
+matched_images/
+*.csv
+*.txt
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
