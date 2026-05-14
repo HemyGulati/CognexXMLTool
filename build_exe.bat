@@ -39,7 +39,7 @@ if errorlevel 1 (
 
 echo.
 echo Building standalone EXE...
-pyinstaller ^
+python -m PyInstaller ^
     --noconfirm ^
     --onefile ^
     --windowed ^
