@@ -1,9 +1,12 @@
 {
-  "app_name": "Cognex XML Tool",
-  "version": "1.0.0",
-  "output_folder": "C:\\ExampleCognexRuns\\Output",
-  "image_root": "C:\\ExampleCognexRuns\\Images",
-  "copy_folder": "C:\\ExampleCognexRuns\\MatchedImages",
+  "app_version": "1.1.0",
+  "xml_files": [
+    "C:/Example/Cognex Runs/Example_Run_01.xml"
+  ],
+  "csv_file": "C:/Example/Cognex Runs/Example_Run_01.csv",
+  "output_folder": "C:/Example/Cognex Runs",
+  "image_root": "",
+  "copy_folder": "",
   "match_mode": "ALL selected result conditions",
   "all_csv_name": "selected_test_results.csv",
   "matched_csv_name": "matched_results.csv",

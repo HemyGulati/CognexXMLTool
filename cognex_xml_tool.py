@@ -1,35 +1,33 @@
 """
 Cognex XML Tool
-===============================
+================
 
 Author: Hemy Gulati
-Version: 1.0.0
+Version: 1.1.0
+GitHub: https://github.com/HemyGulati/CognexXMLTool
 
-A small Tkinter GUI for processing Cognex In-Sight TestRun XML summary files.
+A Tkinter desktop GUI for combining Cognex XML image-path exports with Cognex
+CSV runtime result exports.
 
-Main features
--------------
-- Load one or more Cognex XML files.
-- Automatically detect image names, image paths, and available test names.
-- Let the user choose which test results to output and filter on.
-- Export all selected results to CSV.
-- Export matched results to CSV.
-- Export matched image paths to TXT.
-- Copy matched images into a selected folder for review or re-testing.
+XML + CSV workflow
+------------------
+- XML provides image names, image paths, and image order.
+- CSV provides actual runtime result values.
+- The tool merges both inputs, lets the user select tests/result conditions,
+  then exports CSV/TXT outputs and can copy matched images to a folder.
 
-The app is intentionally written as a single Python file so it can be easily
-reviewed, edited, and packaged into a standalone Windows EXE using PyInstaller.
+The source is intentionally kept as a single Python file so it is easy to review,
+edit, and package into a standalone Windows EXE using PyInstaller.
 """
 
 from __future__ import annotations
 
 import csv
+import ctypes
 import json
 import os
-import platform
 import re
 import shutil
-import subprocess
 import sys
 import traceback
 import webbrowser
@@ -37,7 +35,7 @@ import xml.etree.ElementTree as ET
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Set
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -49,111 +47,72 @@ from tkinter.scrolledtext import ScrolledText
 # -----------------------------------------------------------------------------
 
 APP_NAME = "Cognex XML Tool"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 APP_AUTHOR = "Hemy Gulati"
 APP_GITHUB = "https://github.com/HemyGulati/CognexXMLTool"
+APP_LICENSE = "MIT License"
 
 
 # -----------------------------------------------------------------------------
 # Configuration constants
 # -----------------------------------------------------------------------------
 
-# File extensions treated as image names. Cognex TestRun XMLs commonly use BMP,
-# but the tool also supports other common inspection image formats.
 IMAGE_EXTENSIONS = {".bmp", ".jpg", ".jpeg", ".png", ".tif", ".tiff"}
-
-# Cognex XML files can vary slightly depending on the export method/version.
-# These candidate tag names make the parser more tolerant.
-RESULT_TAGS = ["ActualResult", "ExpectedResult", "Result", "Status", "Actual", "Outcome"]
 PATH_TAGS = ["RefPath", "Path", "ImagePath", "FilePath"]
 
-# Special result filter options displayed in the GUI.
 ANY_TARGET = "(Any / output only)"
 MISSING_TARGET = "(Missing / blank)"
 
-# Default output file names.
-DEFAULT_ALL_RESULTS_CSV = "selected_test_results.csv"
-DEFAULT_MATCHED_RESULTS_CSV = "matched_results.csv"
-DEFAULT_MATCHED_PATHS_TXT = "matched_image_paths.txt"
-DEFAULT_COPY_FOLDER = "matched_images"
-
-# The app automatically loads this file on startup if it exists.
-# It is saved beside the Python script or beside the packaged EXE.
-CONFIG_FILENAME = "cognex_xml_tool_config.json"
-
-# Match mode labels shown in the GUI.
 MATCH_MODE_ALL = "ALL selected result conditions"
 MATCH_MODE_ANY = "ANY selected result condition"
 
+DEFAULT_ALL_RESULTS_CSV = "selected_test_results.csv"
+DEFAULT_MATCHED_RESULTS_CSV = "matched_results.csv"
+DEFAULT_MATCHED_PATHS_TXT = "matched_image_paths.txt"
+DEFAULT_IMAGE_FOLDER = "images"
+CONFIG_FILENAME = "cognex_xml_tool_config.json"
+WINDOWS_INVALID_PATH_CHARS = r'<>:"/\\|?*'
 
-# -----------------------------------------------------------------------------
-# Small UI helpers
-# -----------------------------------------------------------------------------
+# CSV columns that are normally metadata rather than inspection result columns.
+CSV_METADATA_COLUMNS = {
+    "record",
+    "image",
+    "imagename",
+    "image name",
+    "image_name",
+    "filename",
+    "file name",
+    "path",
+    "imagepath",
+    "image path",
+    "filepath",
+    "file path",
+    "station",
+    "program",
+    "counter",
+    "timestamp",
+    "time",
+    "date",
+    "result",
+}
 
-class ToolTip:
-    """Simple hover tooltip for Tkinter/ttk widgets.
+IMAGE_KEY_CANDIDATES = [
+    "ImageName",
+    "Image Name",
+    "image name",
+    "image_name",
+    "Filename",
+    "FileName",
+    "File Name",
+    "ImagePath",
+    "Image Path",
+    "image path",
+    "Path",
+    "FilePath",
+    "File Path",
+]
 
-    Tkinter does not include a built-in tooltip widget. This helper keeps the
-    behaviour lightweight and dependency-free so the app remains easy to package
-    with PyInstaller.
-    """
-
-    def __init__(self, widget: tk.Widget, text: str, delay_ms: int = 400, wraplength: int = 420) -> None:
-        self.widget = widget
-        self.text = text
-        self.delay_ms = delay_ms
-        self.wraplength = wraplength
-        self._after_id: Optional[str] = None
-        self._tip_window: Optional[tk.Toplevel] = None
-
-        self.widget.bind("<Enter>", self._schedule)
-        self.widget.bind("<Leave>", self._hide)
-        self.widget.bind("<ButtonPress>", self._hide)
-
-    def _schedule(self, _event: Optional[tk.Event] = None) -> None:
-        """Schedule the tooltip to appear after a short hover delay."""
-
-        self._cancel_schedule()
-        self._after_id = self.widget.after(self.delay_ms, self._show)
-
-    def _cancel_schedule(self) -> None:
-        """Cancel a tooltip that has been scheduled but not shown yet."""
-
-        if self._after_id is not None:
-            self.widget.after_cancel(self._after_id)
-            self._after_id = None
-
-    def _show(self) -> None:
-        """Display the tooltip near the widget."""
-
-        if self._tip_window is not None or not self.text:
-            return
-
-        x = self.widget.winfo_rootx() + 20
-        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 8
-
-        self._tip_window = tk.Toplevel(self.widget)
-        self._tip_window.wm_overrideredirect(True)
-        self._tip_window.wm_geometry(f"+{x}+{y}")
-
-        label = ttk.Label(
-            self._tip_window,
-            text=self.text,
-            justify="left",
-            relief="solid",
-            borderwidth=1,
-            padding=(8, 6),
-            wraplength=self.wraplength,
-        )
-        label.pack()
-
-    def _hide(self, _event: Optional[tk.Event] = None) -> None:
-        """Hide the tooltip and cancel any pending display."""
-
-        self._cancel_schedule()
-        if self._tip_window is not None:
-            self._tip_window.destroy()
-            self._tip_window = None
+RECORD_KEY_CANDIDATES = ["Record", "record", "Index", "ImageIndex", "Image Index", "ID"]
 
 
 # -----------------------------------------------------------------------------
@@ -161,41 +120,53 @@ class ToolTip:
 # -----------------------------------------------------------------------------
 
 @dataclass
+class XmlImage:
+    """Image metadata read from the Cognex XML file."""
+
+    image_name: str
+    image_path: str = ""
+    source_xml: str = ""
+
+
+@dataclass
+class CsvTestColumn:
+    """A CSV result column that can be selected as an inspection/test."""
+
+    display_name: str
+    csv_column: str
+    detected_values: Set[str] = field(default_factory=set)
+    rows_with_data: int = 0
+
+
+@dataclass
 class ImageRecord:
-    """Results found for one image across one or more XML files."""
+    """Merged image record after XML image metadata is combined with CSV results."""
 
     image_name: str
     image_path: str = ""
     results: Dict[str, str] = field(default_factory=dict)
-    source_files: Set[str] = field(default_factory=set)
-
-
-@dataclass
-class ParsedXml:
-    """Parsed contents of one Cognex XML file."""
-
-    xml_path: Path
-    records: Dict[str, ImageRecord] = field(default_factory=dict)
-    test_counts: Counter = field(default_factory=Counter)
-    test_values: Dict[str, Set[str]] = field(default_factory=lambda: defaultdict(set))
-    validation_folders_seen: int = 0
-    image_records_seen: int = 0
+    csv_rows: int = 0
 
 
 @dataclass
 class MergedData:
-    """Combined result set after loading one or more XML files."""
+    """All merged records and detected test metadata used by the GUI."""
 
     records: Dict[str, ImageRecord] = field(default_factory=dict)
-    test_counts: Counter = field(default_factory=Counter)
-    test_values: Dict[str, Set[str]] = field(default_factory=lambda: defaultdict(set))
-    source_files: List[Path] = field(default_factory=list)
-    duplicate_result_overwrites: int = 0
+    image_order: List[str] = field(default_factory=list)
+    tests: Dict[str, CsvTestColumn] = field(default_factory=dict)
+    xml_files: List[Path] = field(default_factory=list)
+    csv_file: Optional[Path] = None
+    csv_key_mode: str = ""
+    csv_rows_loaded: int = 0
+    xml_images_loaded: int = 0
+    csv_groups_matched: int = 0
+    csv_groups_unmatched: int = 0
 
 
 @dataclass
 class Condition:
-    """A selected test column and optional result filter."""
+    """Selected test and result filter condition."""
 
     test_name: str
     target_result: str = ANY_TARGET
@@ -203,8 +174,9 @@ class Condition:
 
 @dataclass
 class OutputSummary:
-    """Summary of CSV/TXT files created by the processing step."""
+    """Summary of files generated by the processing step."""
 
+    output_folder: Optional[Path] = None
     total_images: int = 0
     tests_selected: int = 0
     filter_conditions: int = 0
@@ -216,7 +188,7 @@ class OutputSummary:
 
 @dataclass
 class CopySummary:
-    """Summary of image copy operation."""
+    """Summary of image-copy operation."""
 
     total_paths: int = 0
     copied: int = 0
@@ -227,88 +199,157 @@ class CopySummary:
 
 
 # -----------------------------------------------------------------------------
-# General helper functions
+# General helpers
 # -----------------------------------------------------------------------------
 
+def set_windows_app_user_model_id() -> None:
+    """Set a Windows AppUserModelID so the taskbar uses the app icon.
+
+    This is mainly useful for source/portable runs. The packaged EXE also gets
+    its icon from PyInstaller via the --icon option in build_exe.bat.
+    """
+
+    if os.name != "nt":
+        return
+
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            f"HemyGulati.{APP_NAME.replace(' ', '')}.{APP_VERSION}"
+        )
+    except Exception:
+        # The app should still run if Windows does not accept the AppUserModelID.
+        pass
+
+def app_base_dir() -> Path:
+    """Return the folder beside the script or beside the packaged EXE."""
+
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+
+
+def resource_path(relative_path: str) -> Path:
+    """Return a resource path that works in source and PyInstaller builds."""
+
+    if hasattr(sys, "_MEIPASS"):
+        return Path(getattr(sys, "_MEIPASS")) / relative_path
+    return app_base_dir() / relative_path
+
+
+def user_config_dir() -> Path:
+    """Return the stable per-user config folder.
+
+    The config is intentionally not saved beside the EXE. When the app is
+    installed under Program Files, that folder is normally read-only for
+    standard users. Using AppData keeps the app installer-friendly and avoids
+    config files appearing in random launch/download folders.
+    """
+
+    if os.name == "nt":
+        base = os.environ.get("APPDATA")
+        if base:
+            return Path(base) / "CognexXMLTool"
+        return Path.home() / "AppData" / "Roaming" / "CognexXMLTool"
+
+    # Fallback for non-Windows development/testing.
+    return Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "CognexXMLTool"
+
+
+def config_path() -> Path:
+    """Return the default config path used for auto-load/auto-save."""
+
+    return user_config_dir() / CONFIG_FILENAME
+
+
+def legacy_config_path() -> Path:
+    """Return the old config location used by earlier portable builds."""
+
+    return app_base_dir() / CONFIG_FILENAME
+
+
+def ensure_config_folder() -> None:
+    """Create the config folder if it does not already exist."""
+
+    user_config_dir().mkdir(parents=True, exist_ok=True)
+
+
 def local_name(tag: str) -> str:
-    """Return an XML tag name without its namespace prefix."""
+    """Return XML tag name without namespace."""
 
     return tag.split("}", 1)[-1]
 
 
-def direct_children(parent: ET.Element, tag_name: str) -> List[ET.Element]:
-    """Return direct child elements matching a tag name, ignoring namespaces."""
+def direct_child_text(parent: ET.Element, possible_names: Iterable[str]) -> str:
+    """Return text from the first matching direct child tag name."""
 
-    return [child for child in list(parent) if local_name(child.tag) == tag_name]
-
-
-def child_text(parent: ET.Element, possible_child_tag_names: Iterable[str]) -> str:
-    """Return direct-child text using the first matching candidate tag name."""
-
-    possible = {name.lower() for name in possible_child_tag_names}
+    wanted = {name.lower() for name in possible_names}
     for child in list(parent):
-        if local_name(child.tag).lower() in possible:
+        if local_name(child.tag).lower() in wanted:
             return (child.text or "").strip()
     return ""
 
 
-def normalise_result(value: str) -> str:
-    """Normalise common result values so CSV output is easier to filter."""
-
-    value = (value or "").strip()
-    lower = value.lower()
-    common = {
-        "pass": "Pass",
-        "passed": "Pass",
-        "ok": "Pass",
-        "true": "Pass",
-        "1": "Pass",
-        "fail": "Fail",
-        "failed": "Fail",
-        "ng": "Fail",
-        "false": "Fail",
-        "0": "Fail",
-    }
-    return common.get(lower, value)
-
-
 def is_image_name(value: str) -> bool:
-    """Return True when a string looks like an image filename."""
+    """Return True if the supplied text looks like an image filename/path."""
 
     return Path(value or "").suffix.lower() in IMAGE_EXTENSIONS
 
 
+def image_basename(value: str) -> str:
+    """Return only the image filename from a filename or full path."""
+
+    return Path((value or "").strip().strip('"')).name
+
+
 def natural_key(value: str) -> List[object]:
-    """Sort image names naturally, e.g. image_2.bmp before image_10.bmp."""
+    """Natural sorting key, e.g. image_2 before image_10."""
 
     parts = re.split(r"(\d+)", value)
-    key: List[object] = []
-    for part in parts:
-        key.append(int(part) if part.isdigit() else part.lower())
-    return key
+    return [int(part) if part.isdigit() else part.lower() for part in parts]
 
 
-def output_image_path(image_name: str, xml_image_path: str, image_root_override: Optional[str]) -> str:
-    """Return the image path written to output files.
+def normalise_result(value: object) -> str:
+    """Convert common Cognex/CSV values into consistent result labels."""
 
-    If the user supplies an image folder override, that folder is used with the
-    image filename. Otherwise the image path stored in the XML is used. If the
-    XML does not contain a full image path, the image filename is used.
-    """
+    text = str(value or "").strip()
+    lower = text.lower()
+    common = {
+        "1": "Pass",
+        "1.0": "Pass",
+        "true": "Pass",
+        "yes": "Pass",
+        "y": "Pass",
+        "ok": "Pass",
+        "pass": "Pass",
+        "passed": "Pass",
+        "0": "Fail",
+        "0.0": "Fail",
+        "false": "Fail",
+        "no": "Fail",
+        "n": "Fail",
+        "ng": "Fail",
+        "fail": "Fail",
+        "failed": "Fail",
+    }
+    return common.get(lower, text)
 
-    if image_root_override:
-        return os.path.join(image_root_override, image_name)
-    if xml_image_path:
-        return xml_image_path
-    return image_name
+
+def is_pass_value(value: object) -> bool:
+    """Return True when a raw or normalised value means pass."""
+
+    return normalise_result(value).lower() == "pass"
+
+
+def is_fail_value(value: object) -> bool:
+    """Return True when a raw or normalised value means fail."""
+
+    return normalise_result(value).lower() == "fail"
 
 
 def unique_destination_path(destination_folder: Path, filename: str) -> Path:
-    """Return a non-conflicting destination path for a copied image.
-
-    If multiple source images share the same filename, the second and later
-    copies receive a suffix such as "_copy1", "_copy2", etc.
-    """
+    """Return a destination path that will not overwrite an existing file."""
 
     destination = destination_folder / filename
     if not destination.exists():
@@ -324,118 +365,359 @@ def unique_destination_path(destination_folder: Path, filename: str) -> Path:
         counter += 1
 
 
+
+
+def sanitize_path_part(value: str, max_length: int = 120) -> str:
+    """Return text safe to use as a Windows folder name."""
+
+    text = str(value or "").strip()
+    for char in WINDOWS_INVALID_PATH_CHARS:
+        text = text.replace(char, "_")
+    text = re.sub(r"\s+", "_", text)
+    text = re.sub(r"_+", "_", text).strip(" _." )
+    if not text:
+        text = "selected_results"
+    return text[:max_length].rstrip(" _." ) or "selected_results"
+
+
+def condition_folder_name(conditions: Sequence[Condition], match_mode: str) -> str:
+    """Build a readable output folder name from selected tests/results."""
+
+    parts: List[str] = []
+    for condition in conditions:
+        test = sanitize_path_part(condition.test_name, max_length=40)
+        target = condition.target_result or ANY_TARGET
+        if target == ANY_TARGET:
+            result = "Any"
+        elif target == MISSING_TARGET:
+            result = "Missing"
+        else:
+            result = sanitize_path_part(target, max_length=30)
+        parts.append(f"{test}_{result}")
+
+    joiner = "_OR_" if match_mode.lower().startswith("any") else "_AND_"
+    return sanitize_path_part(joiner.join(parts), max_length=180)
+
+
+def default_output_base_folder(csv_file: Optional[Path]) -> Path:
+    """Return the default base folder for outputs: the CSV file folder if known."""
+
+    if csv_file:
+        return csv_file.resolve().parent
+    return Path.cwd()
+
+def output_image_path(image_name: str, xml_image_path: str, image_root_override: Optional[str]) -> str:
+    """Return the image path to write to CSV/TXT outputs."""
+
+    if image_root_override:
+        return str(Path(image_root_override) / image_name)
+    if xml_image_path:
+        return xml_image_path
+    return image_name
+
+
 # -----------------------------------------------------------------------------
-# Cognex XML parsing
+# XML parsing: image names, image paths, and order only
 # -----------------------------------------------------------------------------
 
-def parse_cognex_xml(xml_path: Path) -> ParsedXml:
-    """Parse one Cognex TestRun XML file.
+def parse_xml_images(xml_path: Path) -> List[XmlImage]:
+    """Read image names and paths from a Cognex XML summary file.
 
-    Expected structure, based on Cognex TestRun XML summary exports:
-    - Image entries appear as ValidationFolder elements named after image files.
-    - Individual test rows appear as Validate elements inside each image folder.
-    - A Validate row named after the image often stores the image RefPath.
-    - Inspection results are usually stored as ExpectedResult or ActualResult.
-
-    The function is deliberately tolerant because Cognex XML exports can vary
-    slightly between versions/jobs.
+    Version 2 intentionally does not use the XML result values because the XML
+    exports seen in this workflow contain expected results rather than actual
+    runtime results. Actual results are read from the Cognex CSV export instead.
     """
 
-    parsed = ParsedXml(xml_path=xml_path)
     tree = ET.parse(xml_path)
     root = tree.getroot()
+    images: List[XmlImage] = []
 
     for folder in root.iter():
         if local_name(folder.tag) != "ValidationFolder":
             continue
 
-        parsed.validation_folders_seen += 1
         image_name = (folder.attrib.get("Name") or "").strip()
-
-        # Ignore folders that are not image-level entries.
         if not is_image_name(image_name):
             continue
 
-        parsed.image_records_seen += 1
-        record = ImageRecord(image_name=image_name, source_files={str(xml_path)})
-
-        for validate in direct_children(folder, "Validate"):
-            validate_name = (validate.attrib.get("Name") or "").strip()
-            if not validate_name:
-                continue
-
-            result = normalise_result(child_text(validate, RESULT_TAGS))
-            ref_path = child_text(validate, PATH_TAGS)
-
-            # Cognex commonly stores the image path on a Validate row named after
-            # the image file. Treat that as metadata, not as an inspection test.
-            if validate_name == image_name or is_image_name(validate_name):
+        image_path = ""
+        for child in list(folder):
+            if local_name(child.tag) == "Validate":
+                ref_path = direct_child_text(child, PATH_TAGS)
                 if ref_path:
-                    record.image_path = ref_path
-                continue
+                    image_path = ref_path
+                    break
 
-            # Remaining Validate rows are treated as inspection tests.
-            if result:
-                record.results[validate_name] = result
-                parsed.test_counts[validate_name] += 1
-                parsed.test_values[validate_name].add(result)
+        images.append(XmlImage(image_name=image_name, image_path=image_path, source_xml=str(xml_path)))
 
-        if record.results or record.image_path:
-            parsed.records[image_name] = record
-
-    return parsed
+    return images
 
 
-def merge_parsed_xmls(parsed_files: Sequence[ParsedXml]) -> MergedData:
-    """Merge several XML result sets by image name.
+def merge_xml_images(xml_files: Sequence[Path]) -> Tuple[Dict[str, XmlImage], List[str]]:
+    """Merge images from one or more XML files while preserving first-seen order."""
 
-    This supports workflows where different test results are exported from
-    separate Cognex runs. If the same image/test appears in multiple XML files,
-    the later file in the selected list overwrites the earlier value.
+    images_by_name: Dict[str, XmlImage] = {}
+    image_order: List[str] = []
+
+    for xml_file in xml_files:
+        for image in parse_xml_images(xml_file):
+            if image.image_name not in images_by_name:
+                images_by_name[image.image_name] = image
+                image_order.append(image.image_name)
+            elif not images_by_name[image.image_name].image_path and image.image_path:
+                images_by_name[image.image_name].image_path = image.image_path
+
+    return images_by_name, image_order
+
+
+# -----------------------------------------------------------------------------
+# CSV parsing and result aggregation
+# -----------------------------------------------------------------------------
+
+def read_csv_rows(csv_path: Path) -> Tuple[List[Dict[str, str]], List[str]]:
+    """Read CSV rows using utf-8-sig so Excel BOM files are handled.
+
+    Cognex/Excel CSV exports can sometimes include a final blank line that
+    DictReader interprets as a row of empty values. Those blank rows are ignored
+    so they do not appear as unmatched records in the scan summary.
     """
 
-    merged = MergedData(source_files=[p.xml_path for p in parsed_files])
+    with csv_path.open("r", newline="", encoding="utf-8-sig") as file:
+        reader = csv.DictReader(file)
+        fieldnames = list(reader.fieldnames or [])
+        rows: List[Dict[str, str]] = []
+        for row in reader:
+            cleaned = {key: (value or "").strip() for key, value in row.items()}
+            if any(value != "" for value in cleaned.values()):
+                rows.append(cleaned)
+    return rows, fieldnames
 
-    for parsed in parsed_files:
-        merged.test_counts.update(parsed.test_counts)
-        for test_name, values in parsed.test_values.items():
-            merged.test_values[test_name].update(values)
 
-        for image_name, incoming in parsed.records.items():
-            existing = merged.records.get(image_name)
-            if existing is None:
-                merged.records[image_name] = ImageRecord(
-                    image_name=image_name,
-                    image_path=incoming.image_path,
-                    results=dict(incoming.results),
-                    source_files=set(incoming.source_files),
-                )
+def find_first_column(fieldnames: Sequence[str], candidates: Sequence[str]) -> Optional[str]:
+    """Find a CSV column by case-insensitive candidate names."""
+
+    lower_map = {name.lower(): name for name in fieldnames}
+    for candidate in candidates:
+        match = lower_map.get(candidate.lower())
+        if match:
+            return match
+    return None
+
+
+def looks_boolean_result_column(rows: Sequence[Dict[str, str]], column: str) -> bool:
+    """Return True if a column looks like pass/fail, true/false, or 1/0 data."""
+
+    values = {str(row.get(column, "")).strip().lower() for row in rows if str(row.get(column, "")).strip() != ""}
+    if not values:
+        return False
+    allowed = {"0", "1", "0.0", "1.0", "true", "false", "pass", "fail", "passed", "failed", "ok", "ng", "yes", "no", "y", "n"}
+    return values.issubset(allowed)
+
+
+def display_name_for_csv_column(column: str) -> str:
+    """Convert CSV result column names to friendlier test names."""
+
+    if column.lower().endswith("pass") and len(column) > 4:
+        return column[:-4]
+    return column
+
+
+def detect_csv_result_columns(rows: Sequence[Dict[str, str]], fieldnames: Sequence[str]) -> Dict[str, CsvTestColumn]:
+    """Detect selectable inspection result columns from the Cognex CSV.
+
+    Version 2 primarily expects actual result columns that end in Pass, such as
+    InspectionAPass, InspectionBPass, and OverallPass. These are displayed
+    without the Pass suffix where possible.
+
+    If no *Pass columns exist, the function falls back to other boolean-looking
+    non-metadata columns so the app can still be useful for other Cognex exports.
+    Percentage/score columns such as InspectionAPct are intentionally excluded
+    from the result-condition list.
+    """
+
+    def is_excluded(column_name: str) -> bool:
+        name = column_name.strip().lower()
+        return (
+            name in CSV_METADATA_COLUMNS
+            or name.endswith("pct")
+            or name.endswith("percent")
+            or name.endswith("percentage")
+            or name.endswith("score")
+            or name.endswith("confidence")
+        )
+
+    pass_columns = [column for column in fieldnames if column.strip().lower().endswith("pass") and not is_excluded(column)]
+    candidate_columns = pass_columns
+
+    if not candidate_columns:
+        candidate_columns = [
+            column
+            for column in fieldnames
+            if not is_excluded(column) and looks_boolean_result_column(rows, column)
+        ]
+
+    tests: Dict[str, CsvTestColumn] = {}
+    for column in candidate_columns:
+        display_name = display_name_for_csv_column(column)
+        values: Set[str] = set()
+        rows_with_data = 0
+        for row in rows:
+            raw = row.get(column, "")
+            if raw != "":
+                rows_with_data += 1
+                values.add(normalise_result(raw))
+
+        # If a display name already exists, keep the original column name as a
+        # suffix to avoid collisions.
+        original_display_name = display_name
+        suffix = 2
+        while display_name in tests:
+            display_name = f"{original_display_name} ({suffix})"
+            suffix += 1
+
+        tests[display_name] = CsvTestColumn(
+            display_name=display_name,
+            csv_column=column,
+            detected_values=values,
+            rows_with_data=rows_with_data,
+        )
+
+    return tests
+
+
+def group_csv_rows(
+    rows: Sequence[Dict[str, str]],
+    fieldnames: Sequence[str],
+    image_order: Sequence[str],
+) -> Tuple[Dict[str, List[Dict[str, str]]], str, int]:
+    """Group CSV rows by image name.
+
+    Preferred matching methods:
+    1. Use an explicit image/file/path column if present.
+    2. Use a Record/Index column as a 1-based pointer into the XML image order.
+    3. Fallback to CSV row order as a 1-based pointer into XML image order.
+    """
+
+    groups: Dict[str, List[Dict[str, str]]] = defaultdict(list)
+    unmatched = 0
+
+    image_key_column = find_first_column(fieldnames, IMAGE_KEY_CANDIDATES)
+    if image_key_column:
+        for row in rows:
+            image_name = image_basename(row.get(image_key_column, ""))
+            if image_name:
+                groups[image_name].append(row)
+            else:
+                unmatched += 1
+        return groups, f"image column: {image_key_column}", unmatched
+
+    record_column = find_first_column(fieldnames, RECORD_KEY_CANDIDATES)
+    if record_column:
+        for row in rows:
+            raw_record = row.get(record_column, "").strip()
+            try:
+                record_index = int(float(raw_record))
+            except ValueError:
+                unmatched += 1
                 continue
 
-            if not existing.image_path and incoming.image_path:
-                existing.image_path = incoming.image_path
-            existing.source_files.update(incoming.source_files)
+            xml_index = record_index - 1
+            if 0 <= xml_index < len(image_order):
+                groups[image_order[xml_index]].append(row)
+            else:
+                unmatched += 1
+        return groups, f"record column: {record_column} mapped to XML order", unmatched
 
-            for test_name, result in incoming.results.items():
-                if test_name in existing.results and existing.results[test_name] != result:
-                    merged.duplicate_result_overwrites += 1
-                existing.results[test_name] = result
+    for row_index, row in enumerate(rows):
+        if row_index < len(image_order):
+            groups[image_order[row_index]].append(row)
+        else:
+            unmatched += 1
+    return groups, "CSV row order mapped to XML order", unmatched
+
+
+def aggregate_result_for_column(rows: Sequence[Dict[str, str]], column: str) -> str:
+    """Aggregate one CSV result column across one or more rows for the same image.
+
+    Cognex CSV exports may contain multiple rows per image because the job logs
+    station/result-specific strings. For Pass columns, the safest aggregation for
+    this workflow is:
+    - Pass if any row for that image has a pass value.
+    - Fail if no pass values exist but at least one fail value exists.
+    - Otherwise, return the first non-blank normalised value.
+    """
+
+    raw_values = [row.get(column, "") for row in rows if row.get(column, "") != ""]
+    if not raw_values:
+        return ""
+
+    if any(is_pass_value(value) for value in raw_values):
+        return "Pass"
+    if any(is_fail_value(value) for value in raw_values):
+        return "Fail"
+
+    return normalise_result(raw_values[0])
+
+
+def merge_xml_and_csv(xml_files: Sequence[Path], csv_file: Path) -> MergedData:
+    """Merge XML image metadata with actual CSV result data."""
+
+    images_by_name, image_order = merge_xml_images(xml_files)
+    rows, fieldnames = read_csv_rows(csv_file)
+    tests = detect_csv_result_columns(rows, fieldnames)
+    groups, key_mode, unmatched = group_csv_rows(rows, fieldnames, image_order)
+
+    merged = MergedData(
+        xml_files=list(xml_files),
+        csv_file=csv_file,
+        image_order=list(image_order),
+        tests=tests,
+        csv_key_mode=key_mode,
+        csv_rows_loaded=len(rows),
+        xml_images_loaded=len(image_order),
+        csv_groups_unmatched=unmatched,
+    )
+
+    for image_name in image_order:
+        image = images_by_name[image_name]
+        csv_group = groups.get(image_name, [])
+        record = ImageRecord(image_name=image.image_name, image_path=image.image_path, csv_rows=len(csv_group))
+
+        if csv_group:
+            merged.csv_groups_matched += 1
+            for test_name, test_column in tests.items():
+                record.results[test_name] = aggregate_result_for_column(csv_group, test_column.csv_column)
+
+        merged.records[image_name] = record
+
+    # If the CSV contains explicit image names that were not in the XML, include
+    # them so the user can still see that unmatched CSV data existed. These rows
+    # will not have XML image paths unless an image-root override is used.
+    for image_name, csv_group in groups.items():
+        if image_name in merged.records:
+            continue
+        record = ImageRecord(image_name=image_name, image_path="", csv_rows=len(csv_group))
+        for test_name, test_column in tests.items():
+            record.results[test_name] = aggregate_result_for_column(csv_group, test_column.csv_column)
+        merged.records[image_name] = record
+        merged.image_order.append(image_name)
+        merged.csv_groups_unmatched += 1
 
     return merged
 
 
 # -----------------------------------------------------------------------------
-# Filtering and output file generation
+# Filtering and output generation
 # -----------------------------------------------------------------------------
 
 def condition_is_filter(condition: Condition) -> bool:
-    """Return True when a selected condition should filter matched rows."""
+    """Return True when the selected condition should filter matched rows."""
 
     return condition.target_result not in ("", ANY_TARGET)
 
 
 def record_matches(record: ImageRecord, conditions: Sequence[Condition], match_mode: str) -> bool:
-    """Return True if an image record satisfies the selected filters."""
+    """Return True if a record satisfies the selected conditions."""
 
     filters = [condition for condition in conditions if condition_is_filter(condition)]
     if not filters:
@@ -443,12 +725,12 @@ def record_matches(record: ImageRecord, conditions: Sequence[Condition], match_m
 
     checks: List[bool] = []
     for condition in filters:
-        value = (record.results.get(condition.test_name, "") or "").strip()
+        actual = (record.results.get(condition.test_name, "") or "").strip()
         target = (condition.target_result or "").strip()
         if target == MISSING_TARGET:
-            checks.append(value == "")
+            checks.append(actual == "")
         else:
-            checks.append(value.lower() == target.lower())
+            checks.append(actual.lower() == target.lower())
 
     if match_mode.lower().startswith("any"):
         return any(checks)
@@ -458,40 +740,38 @@ def record_matches(record: ImageRecord, conditions: Sequence[Condition], match_m
 def selected_test_order(conditions: Sequence[Condition]) -> List[str]:
     """Return selected tests in output order while removing duplicates."""
 
-    output_order: List[str] = []
+    ordered: List[str] = []
     seen: Set[str] = set()
     for condition in conditions:
         if condition.test_name not in seen:
-            output_order.append(condition.test_name)
+            ordered.append(condition.test_name)
             seen.add(condition.test_name)
-    return output_order
+    return ordered
 
 
-def sorted_records(records: Dict[str, ImageRecord]) -> List[ImageRecord]:
-    """Return image records sorted by image filename."""
+def ordered_records(merged: MergedData) -> List[ImageRecord]:
+    """Return records in XML order, then any extra records in natural order."""
 
-    return [records[name] for name in sorted(records, key=natural_key)]
+    ordered = [merged.records[name] for name in merged.image_order if name in merged.records]
+    remaining = sorted(set(merged.records) - set(merged.image_order), key=natural_key)
+    ordered.extend(merged.records[name] for name in remaining)
+    return ordered
 
 
-def write_results_csv(
-    records: Sequence[ImageRecord],
-    selected_tests: Sequence[str],
-    csv_path: Path,
-    image_root_override: Optional[str],
-) -> None:
+def write_results_csv(records: Sequence[ImageRecord], selected_tests: Sequence[str], csv_path: Path, image_root_override: Optional[str]) -> None:
     """Write image result rows to CSV."""
 
     csv_path.parent.mkdir(parents=True, exist_ok=True)
-    fieldnames = ["image name", "image path"] + [f"{test} result" for test in selected_tests]
+    fieldnames = ["image name", "image path", "csv rows"] + [f"{test} result" for test in selected_tests]
 
-    with csv_path.open("w", newline="", encoding="utf-8") as csv_file:
-        writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+    with csv_path.open("w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=fieldnames)
         writer.writeheader()
-
         for record in records:
             row = {
                 "image name": record.image_name,
                 "image path": output_image_path(record.image_name, record.image_path, image_root_override),
+                "csv rows": record.csv_rows,
             }
             for test in selected_tests:
                 row[f"{test} result"] = record.results.get(test, "")
@@ -499,12 +779,12 @@ def write_results_csv(
 
 
 def write_paths_txt(records: Sequence[ImageRecord], txt_path: Path, image_root_override: Optional[str]) -> None:
-    """Write one image path per line for matched images."""
+    """Write one image path per matched image."""
 
     txt_path.parent.mkdir(parents=True, exist_ok=True)
-    with txt_path.open("w", encoding="utf-8") as txt_file:
+    with txt_path.open("w", encoding="utf-8") as file:
         for record in records:
-            txt_file.write(output_image_path(record.image_name, record.image_path, image_root_override) + "\n")
+            file.write(output_image_path(record.image_name, record.image_path, image_root_override) + "\n")
 
 
 def process_outputs(
@@ -517,13 +797,13 @@ def process_outputs(
     matched_csv_name: str = DEFAULT_MATCHED_RESULTS_CSV,
     matched_txt_name: str = DEFAULT_MATCHED_PATHS_TXT,
 ) -> OutputSummary:
-    """Create CSV/TXT outputs based on selected tests and result filters."""
+    """Create CSV/TXT outputs from merged XML + CSV data."""
 
     selected_tests = selected_test_order(conditions)
     if not selected_tests:
         raise ValueError("No tests selected. Add at least one test condition first.")
 
-    all_records = sorted_records(merged.records)
+    all_records = ordered_records(merged)
     matched_records = [record for record in all_records if record_matches(record, conditions, match_mode)]
 
     all_csv = output_folder / all_csv_name
@@ -535,6 +815,7 @@ def process_outputs(
     write_paths_txt(matched_records, matched_txt, image_root_override)
 
     return OutputSummary(
+        output_folder=output_folder,
         total_images=len(all_records),
         tests_selected=len(selected_tests),
         filter_conditions=sum(1 for condition in conditions if condition_is_filter(condition)),
@@ -545,11 +826,12 @@ def process_outputs(
     )
 
 
-def copy_images_from_txt(paths_txt: Path, destination_folder: Path) -> CopySummary:
-    """Copy images listed in a TXT file into a destination folder.
+def transfer_images_from_txt(paths_txt: Path, destination_folder: Path, move: bool = False) -> CopySummary:
+    """Copy or move images listed in the matched image TXT file.
 
-    The TXT file is expected to contain one image path per line. Missing files are
-    counted and reported rather than stopping the whole copy operation.
+    The matched TXT file is generated by the Run step. Each non-blank line is
+    treated as a full image path. Existing destination filenames are protected by
+    appending _copy1, _copy2, etc.
     """
 
     if not paths_txt.exists():
@@ -558,8 +840,8 @@ def copy_images_from_txt(paths_txt: Path, destination_folder: Path) -> CopySumma
     destination_folder.mkdir(parents=True, exist_ok=True)
     summary = CopySummary(destination_folder=destination_folder)
 
-    with paths_txt.open("r", encoding="utf-8") as txt_file:
-        for raw_line in txt_file:
+    with paths_txt.open("r", encoding="utf-8") as file:
+        for raw_line in file:
             source_text = raw_line.strip().strip('"')
             if not source_text:
                 summary.skipped_blank += 1
@@ -567,14 +849,16 @@ def copy_images_from_txt(paths_txt: Path, destination_folder: Path) -> CopySumma
 
             summary.total_paths += 1
             source_path = Path(source_text)
-
             if not source_path.exists():
                 summary.missing += 1
                 continue
 
             try:
                 destination_path = unique_destination_path(destination_folder, source_path.name)
-                shutil.copy2(source_path, destination_path)
+                if move:
+                    shutil.move(str(source_path), str(destination_path))
+                else:
+                    shutil.copy2(source_path, destination_path)
                 summary.copied += 1
             except Exception:
                 summary.errors += 1
@@ -582,268 +866,253 @@ def copy_images_from_txt(paths_txt: Path, destination_folder: Path) -> CopySumma
     return summary
 
 
+def copy_images_from_txt(paths_txt: Path, destination_folder: Path) -> CopySummary:
+    """Copy images listed in the matched image TXT file."""
+
+    return transfer_images_from_txt(paths_txt, destination_folder, move=False)
+
+
+def move_images_from_txt(paths_txt: Path, destination_folder: Path) -> CopySummary:
+    """Move images listed in the matched image TXT file."""
+
+    return transfer_images_from_txt(paths_txt, destination_folder, move=True)
+
+
+def count_matching_records(merged: MergedData, conditions: Sequence[Condition], match_mode: str) -> int:
+    """Return how many merged image records currently match the selected filters."""
+
+    return sum(1 for record in ordered_records(merged) if record_matches(record, conditions, match_mode))
+
+
+# -----------------------------------------------------------------------------
+# Small tooltip helper
+# -----------------------------------------------------------------------------
+
+class ToolTip:
+    """Simple hover tooltip for Tkinter widgets."""
+
+    def __init__(self, widget: tk.Widget, text: str) -> None:
+        self.widget = widget
+        self.text = text
+        self.tip_window: Optional[tk.Toplevel] = None
+        widget.bind("<Enter>", self.show)
+        widget.bind("<Leave>", self.hide)
+
+    def show(self, _event: Optional[tk.Event] = None) -> None:
+        if self.tip_window or not self.text:
+            return
+        x = self.widget.winfo_rootx() + 20
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 8
+        self.tip_window = tk.Toplevel(self.widget)
+        self.tip_window.wm_overrideredirect(True)
+        self.tip_window.wm_geometry(f"+{x}+{y}")
+        label = ttk.Label(self.tip_window, text=self.text, padding=8, relief="solid", borderwidth=1, wraplength=360)
+        label.pack()
+
+    def hide(self, _event: Optional[tk.Event] = None) -> None:
+        if self.tip_window:
+            self.tip_window.destroy()
+            self.tip_window = None
+
+
 # -----------------------------------------------------------------------------
 # GUI application
 # -----------------------------------------------------------------------------
 
 class CognexXmlToolGui(tk.Tk):
-    """Main Tkinter application window."""
+    """Main Tkinter GUI for Cognex XML + CSV result processing."""
 
     def __init__(self) -> None:
         super().__init__()
         self.title(f"{APP_NAME} v{APP_VERSION}")
-        # Keep the default size practical for laptop screens. The main
-        # workflow area is scrollable, so the app remains usable even when
-        # Windows display scaling or a smaller monitor reduces available height.
-        self.geometry("1100x720")
+        self._set_window_icon()
+        self.geometry("1100x740")
         self.minsize(900, 600)
 
-        # Current working data loaded from XML files.
         self.xml_files: List[Path] = []
-        self.parsed_files: List[ParsedXml] = []
+        self.csv_file: Optional[Path] = None
         self.merged: Optional[MergedData] = None
         self.conditions: List[Condition] = []
-
-        # Last processed output summary. This is used by the copy button.
         self.last_summary: Optional[OutputSummary] = None
 
-        # Tk variables used by input fields.
-        self.output_folder = tk.StringVar(value=str(Path.cwd()))
+        self.output_folder = tk.StringVar(value="")
         self.image_root = tk.StringVar(value="")
-        self.copy_folder = tk.StringVar(value=str(Path.cwd() / DEFAULT_COPY_FOLDER))
+        self.copy_folder = tk.StringVar(value="")
         self.target_result = tk.StringVar(value="Fail")
         self.match_mode = tk.StringVar(value=MATCH_MODE_ALL)
-
         self.all_csv_name = tk.StringVar(value=DEFAULT_ALL_RESULTS_CSV)
         self.matched_csv_name = tk.StringVar(value=DEFAULT_MATCHED_RESULTS_CSV)
         self.matched_txt_name = tk.StringVar(value=DEFAULT_MATCHED_PATHS_TXT)
+        self.preview_text = tk.StringVar(value="Preview: scan inputs and add conditions to see matched count")
+
+        self.match_mode.trace_add("write", lambda *_args: self._update_preview_text())
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
-        self._configure_styles()
         self._build_ui()
         self._load_config_if_available()
+
+    def _set_window_icon(self, window: Optional[tk.Toplevel] = None) -> None:
+        """Set the Tk window icon when the icon asset is available.
+
+        Passing a specific Toplevel lets child dialogs, such as the About window,
+        use the same icon as the main application window.
+        """
+
+        target = window if window is not None else self
+        icon_path = resource_path("assets/cognex_xml_tool.ico")
+        if icon_path.exists():
+            try:
+                target.iconbitmap(str(icon_path))
+            except Exception:
+                # Icon loading can fail on some non-Windows systems; the app should still run.
+                pass
 
     # ------------------------------------------------------------------
     # UI layout
     # ------------------------------------------------------------------
 
-    def _configure_styles(self) -> None:
-        """Configure lightweight custom ttk styles used by the GUI.
-
-        The Run button intentionally uses ttk styling rather than a classic
-        tk.Button. This keeps the native Windows button shape/height and avoids
-        the chunky square look, while still making the primary action a little
-        more obvious. Some Windows themes ignore custom button backgrounds, so
-        the green foreground acts as a reliable fallback.
-        """
-
-        style = ttk.Style(self)
-        base_font = ("Segoe UI", 9, "bold")
-
-        style.configure(
-            "Run.TButton",
-            font=base_font,
-            foreground="#0b5d1e",
-            background="#dff3e5",
-            padding=(8, 3),
-        )
-        style.map(
-            "Run.TButton",
-            foreground=[("disabled", "#7a7a7a"), ("active", "#063d14")],
-            background=[("disabled", "#eeeeee"), ("active", "#cbead4")],
-        )
-
     def _build_ui(self) -> None:
-        """Create all widgets and arrange them in a scrollable main window."""
+        """Build a scrollable main window."""
 
-        # The early versions placed every section directly in the root window.
-        # That worked on large monitors, but on smaller laptop displays the lower
-        # sections could be hidden off-screen. A canvas + internal frame gives the
-        # full workflow a normal vertical scrollbar while keeping the rest of the
-        # UI code simple.
-        scroll_area = ttk.Frame(self)
-        scroll_area.pack(fill="both", expand=True)
-        scroll_area.rowconfigure(0, weight=1)
-        scroll_area.columnconfigure(0, weight=1)
+        container = ttk.Frame(self)
+        container.pack(fill="both", expand=True)
 
-        self.main_canvas = tk.Canvas(scroll_area, borderwidth=0, highlightthickness=0)
-        vertical_scrollbar = ttk.Scrollbar(scroll_area, orient="vertical", command=self.main_canvas.yview)
-        self.main_canvas.configure(yscrollcommand=vertical_scrollbar.set)
+        canvas = tk.Canvas(container, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
+        self.scroll_frame = ttk.Frame(canvas, padding=12)
 
-        self.main_canvas.grid(row=0, column=0, sticky="nsew")
-        vertical_scrollbar.grid(row=0, column=1, sticky="ns")
+        self.scroll_frame.bind("<Configure>", lambda _event: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas_window = canvas.create_window((0, 0), window=self.scroll_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
 
-        outer = ttk.Frame(self.main_canvas, padding=12)
-        self._scroll_window_id = self.main_canvas.create_window((0, 0), window=outer, anchor="nw")
+        def resize_inner(event: tk.Event) -> None:
+            canvas.itemconfigure(canvas_window, width=event.width)
 
-        # Keep the scroll region and inner-frame width in sync with the visible
-        # canvas. This avoids horizontal clipping while still allowing vertical
-        # scrolling when the content is taller than the window.
-        outer.bind(
-            "<Configure>",
-            lambda _event: self.main_canvas.configure(scrollregion=self.main_canvas.bbox("all")),
-        )
-        self.main_canvas.bind(
-            "<Configure>",
-            lambda event: self.main_canvas.itemconfigure(self._scroll_window_id, width=event.width),
-        )
+        canvas.bind("<Configure>", resize_inner)
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
 
-        # Enable mouse-wheel scrolling when the cursor is anywhere over the app
-        # background. Individual widgets such as Treeviews still keep their own
-        # scrollbars for long lists.
-        outer.bind("<Enter>", self._bind_mousewheel)
-        outer.bind("<Leave>", self._unbind_mousewheel)
+        def on_mousewheel(event: tk.Event) -> None:
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
 
-        header = ttk.Frame(outer)
+        canvas.bind_all("<MouseWheel>", on_mousewheel)
+
+        header = ttk.Frame(self.scroll_frame)
         header.pack(fill="x")
-        header.columnconfigure(0, weight=1)
+        ttk.Label(header, text=APP_NAME, font=("Segoe UI", 16, "bold")).pack(side="left", anchor="w")
+        ttk.Button(header, text="ⓘ", width=3, command=self._show_about).pack(side="right")
 
-        title = ttk.Label(header, text=APP_NAME, font=("Segoe UI", 16, "bold"))
-        title.grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            self.scroll_frame,
+            text="Load Cognex XML image metadata + Cognex CSV actual results, select result conditions, then create CSV/TXT outputs.",
+        ).pack(anchor="w", pady=(2, 10))
 
-        # Top-right info button: keeps version/author/GitHub details in the
-        # conventional "about" location without crowding the workflow buttons.
-        info_button = ttk.Button(header, text="ⓘ", width=3, command=self._show_about)
-        info_button.grid(row=0, column=1, sticky="e")
-        ToolTip(info_button, "About this app")
-
-        subtitle = ttk.Label(
-            outer,
-            text=(
-                "Load Cognex XML(s), detect all test names, choose tests/results, "
-                "create CSV/TXT outputs, then copy matched images."
-            ),
-        )
-        subtitle.pack(anchor="w", pady=(2, 8))
-
-        top = ttk.Frame(outer)
+        top = ttk.Frame(self.scroll_frame)
         top.pack(fill="both", expand=False)
         top.columnconfigure(0, weight=1)
         top.columnconfigure(1, weight=1)
 
-        self._build_xml_frame(top).grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        self._build_input_frame(top).grid(row=0, column=0, sticky="nsew", padx=(0, 8))
         self._build_settings_frame(top).grid(row=0, column=1, sticky="nsew", padx=(8, 0))
 
-        middle = ttk.Frame(outer)
-        middle.pack(fill="both", expand=True, pady=(8, 8))
+        middle = ttk.Frame(self.scroll_frame)
+        middle.pack(fill="both", expand=True, pady=(10, 10))
         middle.columnconfigure(0, weight=1)
         middle.columnconfigure(1, weight=1)
-        middle.rowconfigure(0, weight=1)
 
         self._build_detected_tests_frame(middle).grid(row=0, column=0, sticky="nsew", padx=(0, 8))
         self._build_conditions_frame(middle).grid(row=0, column=1, sticky="nsew", padx=(8, 0))
 
-        self._build_action_frame(outer).pack(fill="x", pady=(0, 8))
-        self._build_log_frame(outer).pack(fill="both", expand=True)
+        self._build_action_frame(self.scroll_frame).pack(fill="x", pady=(0, 10))
+        self._build_log_frame(self.scroll_frame).pack(fill="both", expand=True)
 
-        self._log("Ready. Add one or more Cognex XML files, then click Scan XML(s).")
+        self._log("Ready. Add XML file(s), select the Cognex CSV result file, then click Scan XML + CSV.")
 
-    def _bind_mousewheel(self, _event: Optional[tk.Event] = None) -> None:
-        """Bind mouse-wheel events to the main vertical scrollbar."""
-
-        self.main_canvas.bind_all("<MouseWheel>", self._on_mousewheel)
-        self.main_canvas.bind_all("<Button-4>", self._on_mousewheel)
-        self.main_canvas.bind_all("<Button-5>", self._on_mousewheel)
-
-    def _unbind_mousewheel(self, _event: Optional[tk.Event] = None) -> None:
-        """Remove mouse-wheel bindings when the cursor leaves the app body."""
-
-        self.main_canvas.unbind_all("<MouseWheel>")
-        self.main_canvas.unbind_all("<Button-4>")
-        self.main_canvas.unbind_all("<Button-5>")
-
-    def _on_mousewheel(self, event: tk.Event) -> None:
-        """Scroll the main workflow area with Windows/macOS/Linux wheels."""
-
-        if getattr(event, "num", None) == 4:
-            self.main_canvas.yview_scroll(-1, "units")
-        elif getattr(event, "num", None) == 5:
-            self.main_canvas.yview_scroll(1, "units")
-        else:
-            delta = getattr(event, "delta", 0)
-            if delta:
-                # Windows usually reports +/-120. Some touchpads/macOS builds
-                # report smaller values, so keep at least one scroll unit.
-                if abs(delta) >= 120:
-                    steps = int(-1 * (delta / 120))
-                else:
-                    steps = -1 if delta > 0 else 1
-                self.main_canvas.yview_scroll(steps, "units")
-
-    def _build_xml_frame(self, parent: ttk.Frame) -> ttk.LabelFrame:
-        """Build the XML file selection panel."""
-
-        frame = ttk.LabelFrame(parent, text="1. XML files", padding=10)
+    def _build_input_frame(self, parent: ttk.Frame) -> ttk.LabelFrame:
+        frame = ttk.LabelFrame(parent, text="1. Inputs", padding=10)
         frame.columnconfigure(0, weight=1)
-        frame.rowconfigure(0, weight=1)
+        frame.rowconfigure(1, weight=1)
 
+        ttk.Label(frame, text="XML file(s) for image names/paths:").grid(row=0, column=0, columnspan=4, sticky="w")
         self.xml_listbox = tk.Listbox(frame, height=5, exportselection=False)
-        self.xml_listbox.grid(row=0, column=0, columnspan=4, sticky="nsew", pady=(0, 8))
+        self.xml_listbox.grid(row=1, column=0, columnspan=4, sticky="nsew", pady=(4, 8))
 
-        ttk.Button(frame, text="Add XML(s)", command=self._add_xml_files).grid(row=1, column=0, sticky="ew", padx=(0, 4))
-        ttk.Button(frame, text="Remove selected", command=self._remove_selected_xml).grid(row=1, column=1, sticky="ew", padx=4)
-        ttk.Button(frame, text="Clear", command=self._clear_xml_files).grid(row=1, column=2, sticky="ew", padx=4)
-        ttk.Button(frame, text="Scan XML(s)", command=self._scan_xml_files).grid(row=1, column=3, sticky="ew", padx=(4, 0))
+        ttk.Button(frame, text="Add XML(s)", command=self._add_xml_files).grid(row=2, column=0, sticky="ew", padx=(0, 4))
+        ttk.Button(frame, text="Remove selected", command=self._remove_selected_xml).grid(row=2, column=1, sticky="ew", padx=4)
+        ttk.Button(frame, text="Clear XMLs", command=self._clear_xml_files).grid(row=2, column=2, sticky="ew", padx=4)
+
+        ttk.Label(frame, text="CSV actual result file:").grid(row=3, column=0, sticky="w", pady=(10, 3))
+        self.csv_entry = ttk.Entry(frame)
+        self.csv_entry.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(0, 4))
+        ttk.Button(frame, text="Browse CSV", command=self._browse_csv_file).grid(row=4, column=3, sticky="ew", padx=(8, 0), pady=(0, 4))
+
+        ttk.Button(frame, text="Scan XML + CSV", command=self._scan_inputs).grid(row=5, column=0, columnspan=4, sticky="ew", pady=(8, 0))
         return frame
 
     def _build_settings_frame(self, parent: ttk.Frame) -> ttk.LabelFrame:
-        """Build output file/folder settings panel."""
-
         frame = ttk.LabelFrame(parent, text="2. Settings", padding=10)
         frame.columnconfigure(1, weight=1)
 
-        ttk.Label(frame, text="Output folder:").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=3)
+        ttk.Label(frame, text="Output base folder:").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=3)
         ttk.Entry(frame, textvariable=self.output_folder).grid(row=0, column=1, sticky="ew", pady=3)
         ttk.Button(frame, text="Browse", command=lambda: self._browse_folder(self.output_folder)).grid(row=0, column=2, padx=(8, 0), pady=3)
 
         ttk.Label(frame, text="Image folder override:").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=3)
         ttk.Entry(frame, textvariable=self.image_root).grid(row=1, column=1, sticky="ew", pady=3)
         ttk.Button(frame, text="Browse", command=lambda: self._browse_folder(self.image_root)).grid(row=1, column=2, padx=(8, 0), pady=3)
-        ttk.Label(frame, text="Optional. Leave blank to use image paths stored in the XML.").grid(row=2, column=1, sticky="w", pady=(0, 5))
+        ttk.Label(frame, text="Optional. Leave blank to use image paths from XML.").grid(row=2, column=1, sticky="w", pady=(0, 5))
 
-        ttk.Label(frame, text="Copy images to:").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=3)
+        ttk.Label(frame, text="Image transfer folder:").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=3)
         ttk.Entry(frame, textvariable=self.copy_folder).grid(row=3, column=1, sticky="ew", pady=3)
         ttk.Button(frame, text="Browse", command=lambda: self._browse_folder(self.copy_folder)).grid(row=3, column=2, padx=(8, 0), pady=3)
+        ttk.Label(frame, text="Optional. Leave blank to use an images folder inside each run output folder.").grid(row=4, column=1, sticky="w", pady=(0, 5))
 
-        ttk.Label(frame, text="All results CSV:").grid(row=4, column=0, sticky="w", padx=(0, 8), pady=3)
-        ttk.Entry(frame, textvariable=self.all_csv_name).grid(row=4, column=1, sticky="ew", pady=3)
-
-        ttk.Label(frame, text="Matched results CSV:").grid(row=5, column=0, sticky="w", padx=(0, 8), pady=3)
-        ttk.Entry(frame, textvariable=self.matched_csv_name).grid(row=5, column=1, sticky="ew", pady=3)
-
-        ttk.Label(frame, text="Matched paths TXT:").grid(row=6, column=0, sticky="w", padx=(0, 8), pady=3)
-        ttk.Entry(frame, textvariable=self.matched_txt_name).grid(row=6, column=1, sticky="ew", pady=3)
-
-        separator = ttk.Separator(frame, orient="horizontal")
-        separator.grid(row=7, column=0, columnspan=3, sticky="ew", pady=(10, 8))
-
-        ttk.Label(frame, text="Config:").grid(row=8, column=0, sticky="w", padx=(0, 8), pady=3)
-        config_buttons = ttk.Frame(frame)
-        config_buttons.grid(row=8, column=1, columnspan=2, sticky="w", pady=3)
-        ttk.Button(config_buttons, text="Save config", command=self._save_config_with_message).pack(side="left")
-        ttk.Button(config_buttons, text="Load config", command=self._load_config_from_file).pack(side="left", padx=(8, 0))
-        ttk.Button(config_buttons, text="Open app folder", command=lambda: self._open_folder(self._app_directory())).pack(side="left", padx=(8, 0))
-        ttk.Label(
+        match_label = ttk.Label(frame, text="Match mode ⓘ:")
+        match_label.grid(row=5, column=0, sticky="w", padx=(0, 8), pady=3)
+        ToolTip(
+            match_label,
+            "ALL means every selected condition must match. Example: Inspection A = Pass AND Inspection B = Fail.\n\n"
+            "ANY means at least one selected condition must match. Example: Inspection A = Fail OR Inspection B = Fail.",
+        )
+        ttk.Combobox(
             frame,
-            text="The last saved config auto-loads on startup if found beside the script/EXE.",
-        ).grid(row=9, column=1, columnspan=2, sticky="w", pady=(0, 2))
+            textvariable=self.match_mode,
+            values=[MATCH_MODE_ALL, MATCH_MODE_ANY],
+            state="readonly",
+        ).grid(row=5, column=1, columnspan=2, sticky="ew", pady=3)
+
+        ttk.Label(frame, text="All results CSV:").grid(row=6, column=0, sticky="w", padx=(0, 8), pady=3)
+        ttk.Entry(frame, textvariable=self.all_csv_name).grid(row=6, column=1, sticky="ew", pady=3)
+
+        ttk.Label(frame, text="Matched results CSV:").grid(row=7, column=0, sticky="w", padx=(0, 8), pady=3)
+        ttk.Entry(frame, textvariable=self.matched_csv_name).grid(row=7, column=1, sticky="ew", pady=3)
+
+        ttk.Label(frame, text="Matched paths TXT:").grid(row=8, column=0, sticky="w", padx=(0, 8), pady=3)
+        ttk.Entry(frame, textvariable=self.matched_txt_name).grid(row=8, column=1, sticky="ew", pady=3)
+
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=9, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+        buttons.columnconfigure(0, weight=1)
+        buttons.columnconfigure(1, weight=1)
+        ttk.Button(buttons, text="Save config", command=self._save_config).grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        ttk.Button(buttons, text="Load config", command=self._load_config_manual).grid(row=0, column=1, sticky="ew", padx=(4, 0))
         return frame
 
     def _build_detected_tests_frame(self, parent: ttk.Frame) -> ttk.LabelFrame:
-        """Build detected Cognex test list panel."""
-
-        frame = ttk.LabelFrame(parent, text="3. Detected tests", padding=10)
+        frame = ttk.LabelFrame(parent, text="3. Detected CSV result columns", padding=10)
         frame.columnconfigure(0, weight=1)
         frame.rowconfigure(0, weight=1)
 
-        columns = ("count", "values")
-        self.tests_tree = ttk.Treeview(frame, columns=columns, show="tree headings", selectmode="browse")
+        columns = ("csv_column", "rows", "values")
+        self.tests_tree = ttk.Treeview(frame, columns=columns, show="tree headings", selectmode="browse", height=8)
         self.tests_tree.heading("#0", text="Test name")
-        self.tests_tree.heading("count", text="Rows")
+        self.tests_tree.heading("csv_column", text="CSV column")
+        self.tests_tree.heading("rows", text="Rows")
         self.tests_tree.heading("values", text="Detected results")
-        self.tests_tree.column("#0", width=250, stretch=True)
-        self.tests_tree.column("count", width=70, anchor="e", stretch=False)
-        self.tests_tree.column("values", width=190, stretch=True)
+        self.tests_tree.column("#0", width=170, stretch=True)
+        self.tests_tree.column("csv_column", width=140, stretch=True)
+        self.tests_tree.column("rows", width=60, anchor="e", stretch=False)
+        self.tests_tree.column("values", width=150, stretch=True)
         self.tests_tree.grid(row=0, column=0, columnspan=3, sticky="nsew")
         self.tests_tree.bind("<<TreeviewSelect>>", lambda _event: self._update_result_choices())
         self.tests_tree.bind("<Double-1>", lambda _event: self._add_condition())
@@ -857,230 +1126,158 @@ class CognexXmlToolGui(tk.Tk):
         self.result_combo.grid(row=1, column=1, sticky="w", pady=(8, 0))
         ttk.Button(frame, text="Add to output/filter", command=self._add_condition).grid(row=1, column=2, sticky="e", pady=(8, 0))
 
-        ttk.Label(
-            frame,
-            text="Use '(Any / output only)' to include a test as a CSV column without filtering on it.",
-        ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(5, 0))
+        ttk.Label(frame, text="Use '(Any / output only)' to include a CSV result column without filtering on it.").grid(row=2, column=0, columnspan=3, sticky="w", pady=(5, 0))
         return frame
 
     def _build_conditions_frame(self, parent: ttk.Frame) -> ttk.LabelFrame:
-        """Build selected output/filter conditions panel."""
-
-        frame = ttk.LabelFrame(parent, text="4. Selected tests / conditions", padding=10)
+        frame = ttk.LabelFrame(parent, text="4. Selected output/filter conditions", padding=10)
         frame.columnconfigure(0, weight=1)
         frame.rowconfigure(0, weight=1)
 
         columns = ("order", "test", "target")
-        self.conditions_tree = ttk.Treeview(frame, columns=columns, show="headings", selectmode="browse")
+        self.conditions_tree = ttk.Treeview(frame, columns=columns, show="headings", selectmode="browse", height=8)
         self.conditions_tree.heading("order", text="Order")
         self.conditions_tree.heading("test", text="Test name")
         self.conditions_tree.heading("target", text="Result of interest")
         self.conditions_tree.column("order", width=55, anchor="center", stretch=False)
         self.conditions_tree.column("test", width=250, stretch=True)
-        self.conditions_tree.column("target", width=170, stretch=True)
-        self.conditions_tree.grid(row=0, column=0, columnspan=5, sticky="nsew")
+        self.conditions_tree.column("target", width=160, stretch=True)
+        self.conditions_tree.grid(row=0, column=0, columnspan=4, sticky="nsew")
 
         scroll = ttk.Scrollbar(frame, orient="vertical", command=self.conditions_tree.yview)
         self.conditions_tree.configure(yscrollcommand=scroll.set)
-        scroll.grid(row=0, column=5, sticky="ns")
+        scroll.grid(row=0, column=4, sticky="ns")
 
-        # Keep these small action buttons in their own frame so each button has
-        # the same visual width. This avoids the first button stretching with the
-        # resizable table column above it.
-        button_bar = ttk.Frame(frame)
-        button_bar.grid(row=1, column=0, columnspan=5, sticky="w", pady=(8, 0))
-        ttk.Button(button_bar, text="Move up", width=12, command=lambda: self._move_condition(-1)).pack(side="left")
-        ttk.Button(button_bar, text="Move down", width=12, command=lambda: self._move_condition(1)).pack(side="left", padx=(6, 0))
-        ttk.Button(button_bar, text="Remove", width=12, command=self._remove_condition).pack(side="left", padx=(6, 0))
-        ttk.Button(button_bar, text="Clear", width=12, command=self._clear_conditions).pack(side="left", padx=(6, 0))
+        button_row = ttk.Frame(frame)
+        button_row.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        for i in range(4):
+            button_row.columnconfigure(i, weight=1, uniform="condition_buttons")
+        ttk.Button(button_row, text="Move up", command=lambda: self._move_condition(-1)).grid(row=0, column=0, sticky="ew", padx=(0, 3))
+        ttk.Button(button_row, text="Move down", command=lambda: self._move_condition(1)).grid(row=0, column=1, sticky="ew", padx=3)
+        ttk.Button(button_row, text="Remove", command=self._remove_condition).grid(row=0, column=2, sticky="ew", padx=3)
+        ttk.Button(button_row, text="Clear", command=self._clear_conditions).grid(row=0, column=3, sticky="ew", padx=(3, 0))
 
-        ttk.Label(
-            frame,
-            text="Order controls CSV column order. TXT output only contains images matching the selected result conditions.",
-        ).grid(row=2, column=0, columnspan=5, sticky="w", pady=(6, 0))
+        ttk.Label(frame, text="Order controls CSV column order. Filters control which rows appear in matched outputs.").grid(row=2, column=0, columnspan=4, sticky="w", pady=(6, 0))
         return frame
 
     def _build_action_frame(self, parent: ttk.Frame) -> ttk.LabelFrame:
-        """Build the prominent run/copy action area."""
+        frame = ttk.LabelFrame(parent, text="5. Preview, run, and transfer images", padding=10)
+        for column in range(4):
+            frame.columnconfigure(column, weight=1, uniform="action_buttons")
 
-        frame = ttk.LabelFrame(parent, text="Run and copy", padding=10)
-        frame.columnconfigure(1, weight=0)
-        frame.columnconfigure(2, weight=1)
-
-        match_label = ttk.Label(frame, text="Match mode ⓘ:", cursor="question_arrow")
-        match_label.grid(row=0, column=0, sticky="w")
-        ToolTip(match_label, self._match_mode_help_text())
-
-        ttk.Combobox(
-            frame,
-            textvariable=self.match_mode,
-            values=[MATCH_MODE_ALL, MATCH_MODE_ANY],
-            state="readonly",
-            width=34,
-        ).grid(row=0, column=1, sticky="w", padx=(6, 14))
-
-        # Primary action button. It uses ttk.Button so it matches the native
-        # Windows button aesthetic, with only a subtle green accent applied via
-        # the Run.TButton style above.
-        run_button = ttk.Button(
-            frame,
-            text="▶ Run: create outputs",
-            command=self._process,
-            style="Run.TButton",
-            width=22,
-        )
-        run_button.grid(row=0, column=2, sticky="w", padx=(0, 8))
-
-        ttk.Button(frame, text="Copy matched images", command=self._copy_matched_images).grid(row=0, column=3, sticky="w", padx=(0, 8))
-        ttk.Button(frame, text="Open output folder", command=lambda: self._open_folder(Path(self.output_folder.get()))).grid(row=0, column=4, sticky="w", padx=(0, 8))
-        ttk.Button(frame, text="Open copy folder", command=lambda: self._open_folder(Path(self.copy_folder.get()))).grid(row=0, column=5, sticky="w")
+        style = ttk.Style()
+        style.configure("Run.TButton", foreground="dark green")
+        ttk.Button(frame, text="Preview matched count", command=self._preview_matches).grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        ttk.Button(frame, text="▶ Run: create outputs", command=self._process, style="Run.TButton").grid(row=0, column=1, sticky="ew", padx=4)
+        ttk.Button(frame, text="Copy matched images", command=self._copy_matched_images).grid(row=0, column=2, sticky="ew", padx=4)
+        ttk.Button(frame, text="Move matched images", command=self._move_matched_images).grid(row=0, column=3, sticky="ew", padx=(4, 0))
+        ttk.Label(frame, textvariable=self.preview_text).grid(row=1, column=0, columnspan=4, sticky="w", pady=(8, 0))
         return frame
 
     def _build_log_frame(self, parent: ttk.Frame) -> ttk.LabelFrame:
-        """Build application log panel."""
-
-        frame = ttk.LabelFrame(parent, text="Log", padding=8)
-        self.log_box = ScrolledText(frame, height=8, wrap="word")
-        self.log_box.pack(fill="both", expand=True)
+        frame = ttk.LabelFrame(parent, text="Log", padding=10)
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(0, weight=1)
+        self.log_text = ScrolledText(frame, height=8, wrap="word")
+        self.log_text.grid(row=0, column=0, sticky="nsew")
         return frame
 
     # ------------------------------------------------------------------
-    # XML and scan actions
+    # File selection and scan actions
     # ------------------------------------------------------------------
 
     def _add_xml_files(self) -> None:
-        """Prompt the user to add one or more XML files."""
-
-        file_paths = filedialog.askopenfilenames(
-            title="Select Cognex XML file(s)",
-            filetypes=[("XML files", "*.xml"), ("All files", "*.*")],
-        )
-        if not file_paths:
-            return
-
-        existing = {str(path) for path in self.xml_files}
-        for file_path in file_paths:
-            path = Path(file_path)
-            if str(path) not in existing:
+        files = filedialog.askopenfilenames(title="Select Cognex XML file(s)", filetypes=[("XML files", "*.xml"), ("All files", "*.*")])
+        for file in files:
+            path = Path(file)
+            if path not in self.xml_files:
                 self.xml_files.append(path)
-                existing.add(str(path))
-
-        self._refresh_xml_listbox()
-
-        # When the first XML is added, default outputs beside the XML file.
-        if self.xml_files:
-            if self.output_folder.get() == str(Path.cwd()):
-                self.output_folder.set(str(self.xml_files[0].parent))
-            if self.copy_folder.get() == str(Path.cwd() / DEFAULT_COPY_FOLDER):
-                self.copy_folder.set(str(self.xml_files[0].parent / DEFAULT_COPY_FOLDER))
-
+                self.xml_listbox.insert("end", str(path))
         self._autosave_config_quietly()
-        self._log(f"Added {len(file_paths)} XML file(s). Click Scan XML(s) to detect tests.")
 
     def _remove_selected_xml(self) -> None:
-        """Remove selected XML files from the list."""
-
-        selection = list(self.xml_listbox.curselection())
-        for index in reversed(selection):
+        selected = list(self.xml_listbox.curselection())
+        for index in reversed(selected):
             del self.xml_files[index]
-        self._refresh_xml_listbox()
-        self._clear_scan_results()
+            self.xml_listbox.delete(index)
+        self._autosave_config_quietly()
 
     def _clear_xml_files(self) -> None:
-        """Clear all selected XML files and scan results."""
-
         self.xml_files.clear()
-        self._refresh_xml_listbox()
-        self._clear_scan_results()
-
-    def _refresh_xml_listbox(self) -> None:
-        """Refresh XML file list display."""
-
         self.xml_listbox.delete(0, "end")
-        for path in self.xml_files:
-            self.xml_listbox.insert("end", str(path))
-
-    def _clear_scan_results(self, clear_conditions: bool = True) -> None:
-        """Clear loaded/merged XML data and UI result lists.
-
-        Conditions are only cleared when the user explicitly clears/removes XMLs.
-        During a normal scan, keeping conditions allows an auto-loaded config to
-        remain ready for processing after new XML files are selected.
-        """
-
-        self.parsed_files.clear()
         self.merged = None
-        self.last_summary = None
-        for item in self.tests_tree.get_children():
-            self.tests_tree.delete(item)
-        if clear_conditions:
-            self.conditions.clear()
-            self._refresh_conditions_tree()
+        self._clear_tests_tree()
+        self._autosave_config_quietly()
 
-    def _scan_xml_files(self) -> None:
-        """Parse all selected XML files and populate detected tests."""
+    def _browse_csv_file(self) -> None:
+        file = filedialog.askopenfilename(title="Select Cognex CSV result file", filetypes=[("CSV files", "*.csv"), ("All files", "*.*")])
+        if file:
+            self.csv_file = Path(file)
+            self.csv_entry.delete(0, "end")
+            self.csv_entry.insert(0, str(self.csv_file))
+            self.output_folder.set(str(self.csv_file.resolve().parent))
+            self.copy_folder.set("")
+            self._autosave_config_quietly()
 
+    def _scan_inputs(self) -> None:
         try:
             if not self.xml_files:
-                messagebox.showwarning("No XML files", "Please add at least one Cognex XML file first.")
+                messagebox.showwarning("No XML file", "Please add at least one Cognex XML file first.")
                 return
 
-            self._clear_scan_results(clear_conditions=False)
-            self._log("Scanning XML file(s)...")
+            csv_text = self.csv_entry.get().strip()
+            if csv_text:
+                self.csv_file = Path(csv_text)
+            if self.csv_file is None:
+                messagebox.showwarning("No CSV file", "Please select the Cognex CSV actual result file.")
+                return
 
-            parsed_files: List[ParsedXml] = []
-            for xml_path in self.xml_files:
-                if not xml_path.exists():
-                    raise FileNotFoundError(f"Could not find XML file: {xml_path}")
+            missing_xml = [str(path) for path in self.xml_files if not path.exists()]
+            if missing_xml:
+                raise FileNotFoundError("Could not find XML file(s):\n" + "\n".join(missing_xml))
+            if not self.csv_file.exists():
+                raise FileNotFoundError(f"Could not find CSV file: {self.csv_file}")
 
-                parsed = parse_cognex_xml(xml_path)
-                parsed_files.append(parsed)
-                tests_found = len(parsed.test_counts)
-                self._log(f"Scanned: {xml_path.name} | images: {len(parsed.records)} | tests: {tests_found}")
+            if not self.output_folder.get().strip():
+                self.output_folder.set(str(self.csv_file.resolve().parent))
+            if not self.copy_folder.get().strip():
+                self.copy_folder.set("")
 
-            self.parsed_files = parsed_files
-            self.merged = merge_parsed_xmls(parsed_files)
+            self._clear_tests_tree()
+            self.last_summary = None
+            self._log("Scanning XML image metadata and CSV actual results...")
+            self.merged = merge_xml_and_csv(self.xml_files, self.csv_file)
             self._populate_tests_tree()
 
-            self._log(f"Total merged images: {len(self.merged.records)}")
-            self._log(f"Detected test names: {len(self.merged.test_counts)}")
-            missing_selected = [
-                condition.test_name
-                for condition in self.conditions
-                if condition.test_name not in self.merged.test_counts
-            ]
-            if missing_selected:
-                self._log(
-                    "Warning: selected condition test(s) not found in scanned XML(s): "
-                    + ", ".join(dict.fromkeys(missing_selected))
-                )
-            if self.merged.duplicate_result_overwrites:
-                self._log(
-                    f"Note: {self.merged.duplicate_result_overwrites} duplicate image/test results "
-                    "were overwritten by later XML file(s)."
-                )
-            self._log("Select a test, choose the result of interest, then add it to the selected conditions.")
+            self._log(f"XML images loaded: {self.merged.xml_images_loaded}")
+            self._log(f"CSV rows loaded: {self.merged.csv_rows_loaded}")
+            self._log(f"CSV matching mode: {self.merged.csv_key_mode}")
+            self._log(f"Images with matching CSV data: {self.merged.csv_groups_matched}")
+            if self.merged.csv_groups_unmatched:
+                self._log(f"Unmatched/extra CSV groups or rows: {self.merged.csv_groups_unmatched}")
+            self._log(f"Detected CSV result columns: {len(self.merged.tests)}")
+            if not self.merged.tests:
+                self._log("Warning: no result columns detected. Columns ending in 'Pass' or boolean result columns are expected.")
+            self._log("Select detected result columns, choose result of interest, then run outputs.")
+            self._update_preview_text()
+            self._autosave_config_quietly()
         except Exception as exc:
             self._handle_error(exc)
 
-    def _populate_tests_tree(self) -> None:
-        """Show detected test names and result values in the test table."""
-
+    def _clear_tests_tree(self) -> None:
         for item in self.tests_tree.get_children():
             self.tests_tree.delete(item)
+
+    def _populate_tests_tree(self) -> None:
+        self._clear_tests_tree()
         if self.merged is None:
             return
 
-        test_names = sorted(self.merged.test_counts, key=lambda name: (-self.merged.test_counts[name], name.lower()))
+        test_names = sorted(self.merged.tests, key=lambda name: (-self.merged.tests[name].rows_with_data, name.lower()))
         for test_name in test_names:
-            values = sorted(self.merged.test_values.get(test_name, []), key=str.lower)
-            self.tests_tree.insert(
-                "",
-                "end",
-                iid=test_name,
-                text=test_name,
-                values=(self.merged.test_counts[test_name], ", ".join(values)),
-            )
+            test = self.merged.tests[test_name]
+            values = sorted(test.detected_values, key=str.lower)
+            self.tests_tree.insert("", "end", iid=test_name, text=test_name, values=(test.csv_column, test.rows_with_data, ", ".join(values)))
 
         if test_names:
             self.tests_tree.selection_set(test_names[0])
@@ -1091,82 +1288,55 @@ class CognexXmlToolGui(tk.Tk):
     # Condition selection actions
     # ------------------------------------------------------------------
 
-    def _update_result_choices(self) -> None:
-        """Update result dropdown based on the selected test."""
+    def _selected_test_name(self) -> Optional[str]:
+        selected = self.tests_tree.selection()
+        return str(selected[0]) if selected else None
 
+    def _update_result_choices(self) -> None:
         selected_test = self._selected_test_name()
         values: List[str] = []
-        if self.merged and selected_test:
-            values = sorted(self.merged.test_values.get(selected_test, []), key=str.lower)
+        if self.merged and selected_test and selected_test in self.merged.tests:
+            values = sorted(self.merged.tests[selected_test].detected_values, key=str.lower)
 
         combo_values = values + [ANY_TARGET, MISSING_TARGET]
         self.result_combo.configure(values=combo_values)
-
-        # Default to Fail where possible because inspection review workflows often
-        # focus on failures. The user can still select any detected value.
-        if values:
-            if "Fail" in values:
-                self.target_result.set("Fail")
-            elif "Pass" in values:
-                self.target_result.set("Pass")
-            else:
-                self.target_result.set(values[0])
+        if "Fail" in values:
+            self.target_result.set("Fail")
+        elif "Pass" in values:
+            self.target_result.set("Pass")
+        elif values:
+            self.target_result.set(values[0])
         else:
             self.target_result.set(ANY_TARGET)
 
-    def _selected_test_name(self) -> Optional[str]:
-        """Return the currently selected detected test name."""
-
-        selected = self.tests_tree.selection()
-        if not selected:
-            return None
-        return str(selected[0])
-
     def _add_condition(self) -> None:
-        """Add selected detected test to the output/filter list."""
-
         test_name = self._selected_test_name()
         if not test_name:
-            messagebox.showwarning("No test selected", "Please select a detected test first.")
+            messagebox.showwarning("No test selected", "Please select a detected CSV result column first.")
             return
-
         target = self.target_result.get().strip() or ANY_TARGET
         self.conditions.append(Condition(test_name=test_name, target_result=target))
         self._refresh_conditions_tree()
         self._autosave_config_quietly()
 
     def _refresh_conditions_tree(self) -> None:
-        """Refresh selected condition table."""
-
         for item in self.conditions_tree.get_children():
             self.conditions_tree.delete(item)
         for index, condition in enumerate(self.conditions, start=1):
-            self.conditions_tree.insert(
-                "",
-                "end",
-                iid=str(index - 1),
-                values=(index, condition.test_name, condition.target_result),
-            )
+            self.conditions_tree.insert("", "end", iid=str(index - 1), values=(index, condition.test_name, condition.target_result))
+        self._update_preview_text()
 
     def _selected_condition_index(self) -> Optional[int]:
-        """Return the index of the selected condition row."""
-
         selected = self.conditions_tree.selection()
-        if not selected:
-            return None
-        return int(selected[0])
+        return int(selected[0]) if selected else None
 
     def _move_condition(self, direction: int) -> None:
-        """Move selected condition up or down in output order."""
-
         index = self._selected_condition_index()
         if index is None:
             return
-
         new_index = index + direction
         if new_index < 0 or new_index >= len(self.conditions):
             return
-
         self.conditions[index], self.conditions[new_index] = self.conditions[new_index], self.conditions[index]
         self._refresh_conditions_tree()
         self.conditions_tree.selection_set(str(new_index))
@@ -1174,8 +1344,6 @@ class CognexXmlToolGui(tk.Tk):
         self._autosave_config_quietly()
 
     def _remove_condition(self) -> None:
-        """Remove selected condition from output/filter list."""
-
         index = self._selected_condition_index()
         if index is None:
             return
@@ -1184,8 +1352,6 @@ class CognexXmlToolGui(tk.Tk):
         self._autosave_config_quietly()
 
     def _clear_conditions(self) -> None:
-        """Clear all selected conditions."""
-
         self.conditions.clear()
         self._refresh_conditions_tree()
         self._autosave_config_quietly()
@@ -1195,145 +1361,163 @@ class CognexXmlToolGui(tk.Tk):
     # ------------------------------------------------------------------
 
     def _browse_folder(self, variable: tk.StringVar) -> None:
-        """Prompt the user to select a folder and assign it to a Tk variable."""
-
         folder = filedialog.askdirectory(title="Select folder")
         if folder:
             variable.set(folder)
+            self._autosave_config_quietly()
 
-    def _get_output_folder(self) -> Path:
-        """Return output folder, creating it if required."""
+    def _get_output_base_folder(self) -> Path:
+        """Return the base output folder, defaulting to the CSV parent folder."""
 
-        folder = Path(self.output_folder.get().strip() or Path.cwd())
+        base_text = self.output_folder.get().strip()
+        if base_text:
+            base = Path(base_text)
+        else:
+            base = default_output_base_folder(self.csv_file)
+            self.output_folder.set(str(base))
+        base.mkdir(parents=True, exist_ok=True)
+        return base
+
+    def _get_run_output_folder(self) -> Path:
+        """Return the result-specific output folder for the current selected conditions."""
+
+        base = self._get_output_base_folder()
+        folder_name = condition_folder_name(self.conditions, self.match_mode.get())
+        folder = base / folder_name
         folder.mkdir(parents=True, exist_ok=True)
         return folder
 
-    def _process(self) -> None:
-        """Create CSV/TXT outputs from current XML data and selected conditions."""
+    def _get_image_transfer_folder(self) -> Path:
+        """Return custom image transfer folder or the default images subfolder for the last run."""
 
+        custom = self.copy_folder.get().strip()
+        if custom:
+            folder = Path(custom)
+        elif self.last_summary and self.last_summary.output_folder:
+            folder = self.last_summary.output_folder / DEFAULT_IMAGE_FOLDER
+        else:
+            folder = self._get_run_output_folder() / DEFAULT_IMAGE_FOLDER
+        folder.mkdir(parents=True, exist_ok=True)
+        return folder
+
+    def _update_preview_text(self) -> None:
+        """Update the small preview label without showing pop-ups."""
+
+        if self.merged is None:
+            self.preview_text.set("Preview: scan inputs and add conditions to see matched count")
+            return
+        if not self.conditions:
+            self.preview_text.set(f"Preview: {len(ordered_records(self.merged))} images loaded, no filters selected")
+            return
+        matched = count_matching_records(self.merged, self.conditions, self.match_mode.get())
+        active_filters = sum(1 for condition in self.conditions if condition_is_filter(condition))
+        self.preview_text.set(f"Preview: {matched} matching images from {len(ordered_records(self.merged))} total images ({active_filters} active filter conditions)")
+
+    def _preview_matches(self) -> None:
+        """Show the current matched count before the user creates outputs or copies images."""
+
+        if self.merged is None:
+            messagebox.showwarning("Scan first", "Please scan the XML + CSV inputs first.")
+            return
+        if not self.conditions:
+            messagebox.showwarning("No selected tests", "Please add at least one CSV result column to the selected conditions list.")
+            return
+        self._update_preview_text()
+        self._log(self.preview_text.get())
+        messagebox.showinfo("Preview matched count", self.preview_text.get())
+
+    def _process(self) -> None:
         try:
             if self.merged is None:
-                messagebox.showwarning("Scan first", "Please scan the XML file(s) first.")
+                messagebox.showwarning("Scan first", "Please scan the XML + CSV inputs first.")
                 return
             if not self.conditions:
-                messagebox.showwarning("No selected tests", "Please add at least one test to the selected conditions list.")
+                messagebox.showwarning("No selected tests", "Please add at least one CSV result column to the selected conditions list.")
                 return
 
-            output_folder = self._get_output_folder()
+            output_folder = self._get_run_output_folder()
             image_root = self.image_root.get().strip() or None
-            all_csv_name = self.all_csv_name.get().strip() or DEFAULT_ALL_RESULTS_CSV
-            matched_csv_name = self.matched_csv_name.get().strip() or DEFAULT_MATCHED_RESULTS_CSV
-            matched_txt_name = self.matched_txt_name.get().strip() or DEFAULT_MATCHED_PATHS_TXT
-
-            self._log("Processing outputs...")
             summary = process_outputs(
                 merged=self.merged,
                 conditions=self.conditions,
                 output_folder=output_folder,
                 image_root_override=image_root,
                 match_mode=self.match_mode.get(),
-                all_csv_name=all_csv_name,
-                matched_csv_name=matched_csv_name,
-                matched_txt_name=matched_txt_name,
+                all_csv_name=self.all_csv_name.get().strip() or DEFAULT_ALL_RESULTS_CSV,
+                matched_csv_name=self.matched_csv_name.get().strip() or DEFAULT_MATCHED_RESULTS_CSV,
+                matched_txt_name=self.matched_txt_name.get().strip() or DEFAULT_MATCHED_PATHS_TXT,
             )
             self.last_summary = summary
+            self._update_preview_text()
             self._autosave_config_quietly()
             self._show_summary(summary)
         except Exception as exc:
             self._handle_error(exc)
 
-    def _copy_matched_images(self) -> None:
-        """Copy matched images from the generated TXT list to the selected folder."""
+    def _resolve_current_matched_txt_path(self) -> Path:
+        if self.last_summary and self.last_summary.matched_paths_txt:
+            return self.last_summary.matched_paths_txt
+        return self._get_run_output_folder() / (self.matched_txt_name.get().strip() or DEFAULT_MATCHED_PATHS_TXT)
 
+    def _copy_matched_images(self) -> None:
         try:
             paths_txt = self._resolve_current_matched_txt_path()
-            destination = Path(self.copy_folder.get().strip() or (Path(self.output_folder.get()) / DEFAULT_COPY_FOLDER))
-
-            if not destination:
-                messagebox.showwarning("No destination", "Please choose a copy destination folder first.")
-                return
-
-            self._log(f"Copying matched images from: {paths_txt}")
-            self._log(f"Copy destination: {destination}")
+            destination = self._get_image_transfer_folder()
             summary = copy_images_from_txt(paths_txt, destination)
-            self._show_copy_summary(summary)
+            self._log(f"Copy complete. Copied: {summary.copied}, missing: {summary.missing}, errors: {summary.errors}")
+            messagebox.showinfo(
+                "Copy complete",
+                f"Copied: {summary.copied}\nMissing: {summary.missing}\nErrors: {summary.errors}\nDestination:\n{summary.destination_folder}",
+            )
         except Exception as exc:
             self._handle_error(exc)
 
-    def _resolve_current_matched_txt_path(self) -> Path:
-        """Return the matched TXT path from the last run or current settings."""
-
-        if self.last_summary and self.last_summary.matched_paths_txt:
-            return self.last_summary.matched_paths_txt
-        return Path(self.output_folder.get().strip() or Path.cwd()) / (self.matched_txt_name.get().strip() or DEFAULT_MATCHED_PATHS_TXT)
+    def _move_matched_images(self) -> None:
+        try:
+            paths_txt = self._resolve_current_matched_txt_path()
+            destination = self._get_image_transfer_folder()
+            if not messagebox.askyesno(
+                "Move matched images",
+                "This will move the matched image files out of their current folder. Continue?",
+            ):
+                return
+            summary = move_images_from_txt(paths_txt, destination)
+            self._log(f"Move complete. Moved: {summary.copied}, missing: {summary.missing}, errors: {summary.errors}")
+            messagebox.showinfo(
+                "Move complete",
+                f"Moved: {summary.copied}\nMissing: {summary.missing}\nErrors: {summary.errors}\nDestination:\n{summary.destination_folder}",
+            )
+        except Exception as exc:
+            self._handle_error(exc)
 
     def _show_summary(self, summary: OutputSummary) -> None:
-        """Log processing summary and show a popup."""
-
-        self._log("Done.")
-        self._log(f"Images processed: {summary.total_images}")
-        self._log(f"Selected tests / CSV columns: {summary.tests_selected}")
+        self._log("Output complete.")
+        self._log(f"Total images: {summary.total_images}")
+        self._log(f"Selected tests: {summary.tests_selected}")
         self._log(f"Active filter conditions: {summary.filter_conditions}")
         self._log(f"Matched images: {summary.matched_images}")
+        self._log(f"Output folder: {summary.output_folder}")
         self._log(f"All results CSV: {summary.all_results_csv}")
         self._log(f"Matched results CSV: {summary.matched_results_csv}")
-        self._log(f"Matched image path TXT: {summary.matched_paths_txt}")
-        self._log("-" * 80)
-
+        self._log(f"Matched paths TXT: {summary.matched_paths_txt}")
         messagebox.showinfo(
-            "Processing complete",
-            "Done.\n\n"
+            "Outputs created",
+            f"Total images: {summary.total_images}\n"
             f"Matched images: {summary.matched_images}\n\n"
-            f"TXT path list:\n{summary.matched_paths_txt}\n\n"
-            "Use 'Copy matched images' to copy those images into the selected folder.",
-        )
-
-    def _show_copy_summary(self, summary: CopySummary) -> None:
-        """Log copy summary and show a popup."""
-
-        self._log("Copy complete.")
-        self._log(f"Paths in TXT: {summary.total_paths}")
-        self._log(f"Images copied: {summary.copied}")
-        self._log(f"Missing source images: {summary.missing}")
-        self._log(f"Copy errors: {summary.errors}")
-        self._log(f"Destination folder: {summary.destination_folder}")
-        self._log("-" * 80)
-
-        messagebox.showinfo(
-            "Copy complete",
-            "Copy complete.\n\n"
-            f"Images copied: {summary.copied}\n"
-            f"Missing source images: {summary.missing}\n"
-            f"Copy errors: {summary.errors}\n\n"
-            f"Destination folder:\n{summary.destination_folder}",
+            f"Output folder:\n{summary.output_folder}\n\n"
+            f"All results CSV:\n{summary.all_results_csv}\n\n"
+            f"Matched paths TXT:\n{summary.matched_paths_txt}",
         )
 
     # ------------------------------------------------------------------
-    # Configuration actions
+    # Config actions
     # ------------------------------------------------------------------
 
-    def _app_directory(self) -> Path:
-        """Return the folder that should contain the app config file.
-
-        When running from a PyInstaller EXE, sys.executable points to the EXE.
-        When running from Python, __file__ points to this source file.
-        """
-
-        if getattr(sys, "frozen", False):
-            return Path(sys.executable).resolve().parent
-        return Path(__file__).resolve().parent
-
-    def _config_path(self) -> Path:
-        """Return the path to the auto-loaded JSON config file."""
-
-        return self._app_directory() / CONFIG_FILENAME
-
-    def _current_config(self) -> Dict[str, object]:
-        """Build a JSON-serialisable dictionary of the current GUI settings."""
-
+    def _config_dict(self) -> Dict[str, object]:
         return {
-            "app_name": APP_NAME,
-            "version": APP_VERSION,
+            "app_version": APP_VERSION,
+            "xml_files": [str(path) for path in self.xml_files],
+            "csv_file": str(self.csv_file or self.csv_entry.get().strip() or ""),
             "output_folder": self.output_folder.get(),
             "image_root": self.image_root.get(),
             "copy_folder": self.copy_folder.get(),
@@ -1341,231 +1525,155 @@ class CognexXmlToolGui(tk.Tk):
             "all_csv_name": self.all_csv_name.get(),
             "matched_csv_name": self.matched_csv_name.get(),
             "matched_txt_name": self.matched_txt_name.get(),
-            "conditions": [
-                {"test_name": condition.test_name, "target_result": condition.target_result}
-                for condition in self.conditions
-            ],
+            "conditions": [{"test_name": c.test_name, "target_result": c.target_result} for c in self.conditions],
         }
 
-    def _apply_config(self, config: Dict[str, object]) -> None:
-        """Apply settings loaded from the JSON config file.
+    def _apply_config(self, data: Dict[str, object]) -> None:
+        self.xml_files = [Path(text) for text in data.get("xml_files", []) if str(text).strip()]
+        self.xml_listbox.delete(0, "end")
+        for path in self.xml_files:
+            self.xml_listbox.insert("end", str(path))
 
-        The config is intentionally tolerant: missing or old fields are ignored
-        so future versions can still read older config files.
-        """
+        csv_text = str(data.get("csv_file", "") or "")
+        self.csv_file = Path(csv_text) if csv_text else None
+        self.csv_entry.delete(0, "end")
+        self.csv_entry.insert(0, csv_text)
 
-        def text_value(key: str, default: str = "") -> str:
-            value = config.get(key, default)
-            return value if isinstance(value, str) else default
+        self.output_folder.set(str(data.get("output_folder", self.output_folder.get()) or self.output_folder.get()))
+        self.image_root.set(str(data.get("image_root", "") or ""))
+        self.copy_folder.set(str(data.get("copy_folder", self.copy_folder.get()) or self.copy_folder.get()))
+        self.match_mode.set(str(data.get("match_mode", MATCH_MODE_ALL) or MATCH_MODE_ALL))
+        self.all_csv_name.set(str(data.get("all_csv_name", DEFAULT_ALL_RESULTS_CSV) or DEFAULT_ALL_RESULTS_CSV))
+        self.matched_csv_name.set(str(data.get("matched_csv_name", DEFAULT_MATCHED_RESULTS_CSV) or DEFAULT_MATCHED_RESULTS_CSV))
+        self.matched_txt_name.set(str(data.get("matched_txt_name", DEFAULT_MATCHED_PATHS_TXT) or DEFAULT_MATCHED_PATHS_TXT))
 
-        self.output_folder.set(text_value("output_folder", self.output_folder.get()))
-        self.image_root.set(text_value("image_root", self.image_root.get()))
-        self.copy_folder.set(text_value("copy_folder", self.copy_folder.get()))
-        self.all_csv_name.set(text_value("all_csv_name", DEFAULT_ALL_RESULTS_CSV))
-        self.matched_csv_name.set(text_value("matched_csv_name", DEFAULT_MATCHED_RESULTS_CSV))
-        self.matched_txt_name.set(text_value("matched_txt_name", DEFAULT_MATCHED_PATHS_TXT))
-
-        mode = text_value("match_mode", MATCH_MODE_ALL)
-        if mode not in {MATCH_MODE_ALL, MATCH_MODE_ANY}:
-            mode = MATCH_MODE_ALL
-        self.match_mode.set(mode)
-
-        loaded_conditions: List[Condition] = []
-        raw_conditions = config.get("conditions", [])
-        if isinstance(raw_conditions, list):
-            for item in raw_conditions:
-                if not isinstance(item, dict):
-                    continue
-                test_name = item.get("test_name", "")
-                target_result = item.get("target_result", ANY_TARGET)
-                if isinstance(test_name, str) and test_name.strip():
-                    loaded_conditions.append(
-                        Condition(
-                            test_name=test_name.strip(),
-                            target_result=target_result if isinstance(target_result, str) else ANY_TARGET,
-                        )
-                    )
-
-        self.conditions = loaded_conditions
+        self.conditions = []
+        for item in data.get("conditions", []):
+            if isinstance(item, dict) and item.get("test_name"):
+                self.conditions.append(Condition(test_name=str(item.get("test_name")), target_result=str(item.get("target_result", ANY_TARGET))))
         self._refresh_conditions_tree()
 
-    def _load_config_if_available(self) -> None:
-        """Auto-load the last saved config if the config file exists."""
-
-        config_path = self._config_path()
-        if not config_path.exists():
-            self._log(f"No saved config found. A config will be created at: {config_path}")
-            return
-
-        self._load_config_path(config_path, show_popup=False)
-
-    def _load_config_path(self, config_path: Path, show_popup: bool = True) -> None:
-        """Load a JSON config file and apply it to the GUI."""
-
+    def _save_config(self) -> None:
         try:
-            with config_path.open("r", encoding="utf-8") as config_file:
-                config = json.load(config_file)
-            if not isinstance(config, dict):
-                raise ValueError("Config file is not a JSON object.")
-            self._apply_config(config)
-            self._log(f"Loaded config: {config_path}")
-            if self.conditions:
-                self._log(f"Loaded {len(self.conditions)} saved test condition(s). Add XML(s), scan, then process.")
-            if show_popup:
-                messagebox.showinfo("Config loaded", f"Loaded config:\n{config_path}")
+            ensure_config_folder()
+            path = config_path()
+            path.write_text(json.dumps(self._config_dict(), indent=2), encoding="utf-8")
+            self._log(f"Saved config: {path}")
+            messagebox.showinfo("Config saved", f"Saved config:\n{path}")
         except Exception as exc:
-            self._log(f"Could not load config file: {config_path}")
-            self._log(f"Config load error: {exc}")
-            if show_popup:
-                messagebox.showerror("Config load error", f"Could not load config:\n{config_path}\n\n{exc}")
-
-    def _load_config_from_file(self) -> None:
-        """Prompt the user to manually load a config JSON file."""
-
-        file_path = filedialog.askopenfilename(
-            title="Load Cognex XML Tool config",
-            filetypes=[("JSON config", "*.json"), ("All files", "*.*")],
-            initialdir=str(self._app_directory()),
-        )
-        if file_path:
-            self._load_config_path(Path(file_path), show_popup=True)
-
-    def _save_config(self) -> Path:
-        """Save the current GUI config to JSON and return the config path."""
-
-        config_path = self._config_path()
-        with config_path.open("w", encoding="utf-8") as config_file:
-            json.dump(self._current_config(), config_file, indent=2)
-        return config_path
+            self._handle_error(exc)
 
     def _autosave_config_quietly(self) -> None:
-        """Best-effort save used after small GUI changes."""
-
         try:
-            self._save_config()
+            ensure_config_folder()
+            config_path().write_text(json.dumps(self._config_dict(), indent=2), encoding="utf-8")
         except Exception:
-            # Avoid interrupting normal use for non-critical autosave failures.
             pass
 
-    def _save_config_with_message(self) -> None:
-        """Save config and show a user-facing confirmation."""
+    def _load_config_if_available(self) -> None:
+        """Auto-load the saved config from the stable AppData location.
 
+        If a user previously ran an older portable build, we also look for the
+        old beside-the-EXE config once and migrate it into AppData.
+        """
+
+        path = config_path()
+        legacy_path = legacy_config_path()
+
+        if not path.exists() and legacy_path.exists() and legacy_path != path:
+            try:
+                ensure_config_folder()
+                path.write_text(legacy_path.read_text(encoding="utf-8"), encoding="utf-8")
+                self._log(f"Migrated config to: {path}")
+            except Exception as exc:
+                self._log(f"Could not migrate old config: {exc}")
+
+        if not path.exists():
+            self._log("No saved config found; using defaults.")
+            self._log(f"Default config location: {path}")
+            return
         try:
-            config_path = self._save_config()
-            self._log(f"Saved config: {config_path}")
-            messagebox.showinfo("Config saved", f"Saved config:\n{config_path}")
+            data = json.loads(path.read_text(encoding="utf-8"))
+            self._apply_config(data)
+            self._log(f"Loaded config: {path}")
+        except Exception as exc:
+            self._log(f"Could not load config: {exc}")
+
+    def _load_config_manual(self) -> None:
+        file = filedialog.askopenfilename(title="Load config", filetypes=[("JSON files", "*.json"), ("All files", "*.*")])
+        if not file:
+            return
+        try:
+            data = json.loads(Path(file).read_text(encoding="utf-8"))
+            self._apply_config(data)
+            self._log(f"Loaded config: {file}")
         except Exception as exc:
             self._handle_error(exc)
 
     def _on_close(self) -> None:
-        """Save the current config before closing the GUI."""
-
-        try:
-            config_path = self._save_config()
-            self._log(f"Saved config on close: {config_path}")
-        except Exception as exc:
-            # Do not block closing if the config cannot be saved.
-            self._log(f"Could not save config on close: {exc}")
+        self._autosave_config_quietly()
         self.destroy()
 
-    def _match_mode_help_text(self) -> str:
-        """Return short help text used by the match-mode hover tooltip."""
-
-        return (
-            "ALL selected result conditions: an image must match every active result filter.\n"
-            "Example: Inspection A = Pass AND Inspection B = Fail.\n\n"
-            "ANY selected result condition: an image only needs to match at least one active result filter.\n"
-            "Example: Inspection B = Fail OR Print = Fail OR Measurement = Fail.\n\n"
-            "Use '(Any / output only)' when you want a test included as a CSV column but not used as a filter."
-        )
-
-    def _show_match_mode_help(self) -> None:
-        """Explain the ALL/ANY matching behaviour to the user."""
-
-        messagebox.showinfo("Match mode help", self._match_mode_help_text())
+    # ------------------------------------------------------------------
+    # Misc UI helpers
+    # ------------------------------------------------------------------
 
     def _show_about(self) -> None:
-        """Open the app information window from the top-right info button."""
-
         window = tk.Toplevel(self)
         window.title(f"About {APP_NAME}")
         window.resizable(False, False)
         window.transient(self)
-        window.grab_set()
+        self._set_window_icon(window)
 
-        container = ttk.Frame(window, padding=16)
-        container.pack(fill="both", expand=True)
+        frame = ttk.Frame(window, padding=16)
+        frame.pack(fill="both", expand=True)
 
-        ttk.Label(container, text=APP_NAME, font=("Segoe UI", 14, "bold")).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
-        ttk.Label(container, text="Version:").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=2)
-        ttk.Label(container, text=APP_VERSION).grid(row=1, column=1, sticky="w", pady=2)
-        ttk.Label(container, text="Author:").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=2)
-        ttk.Label(container, text=APP_AUTHOR).grid(row=2, column=1, sticky="w", pady=2)
-        ttk.Label(container, text="GitHub:").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=2)
-        github_label = ttk.Label(container, text=APP_GITHUB, foreground="blue", cursor="hand2")
-        github_label.grid(row=3, column=1, sticky="w", pady=2)
-        github_label.bind("<Button-1>", lambda _event: webbrowser.open(APP_GITHUB))
+        header = ttk.Frame(frame)
+        header.pack(fill="x")
 
-        button_bar = ttk.Frame(container)
-        button_bar.grid(row=4, column=0, columnspan=2, sticky="e", pady=(14, 0))
-        ttk.Button(button_bar, text="Open GitHub", command=lambda: webbrowser.open(APP_GITHUB)).pack(side="left")
-        ttk.Button(button_bar, text="Close", command=window.destroy).pack(side="left", padx=(8, 0))
+        icon_image = None
+        png_path = resource_path("assets/cognex_xml_tool.png")
+        if png_path.exists():
+            try:
+                icon_image = tk.PhotoImage(file=str(png_path)).subsample(2, 2)
+                icon_label = ttk.Label(header, image=icon_image)
+                icon_label.image = icon_image  # Keep a reference so Tk does not garbage-collect it.
+                icon_label.pack(side="left", padx=(0, 12))
+            except Exception:
+                icon_image = None
 
-        window.update_idletasks()
-        x = self.winfo_rootx() + max(0, (self.winfo_width() - window.winfo_width()) // 2)
-        y = self.winfo_rooty() + max(0, (self.winfo_height() - window.winfo_height()) // 2)
-        window.geometry(f"+{x}+{y}")
+        title_frame = ttk.Frame(header)
+        title_frame.pack(side="left", fill="x", expand=True)
+        ttk.Label(title_frame, text=APP_NAME, font=("Segoe UI", 14, "bold")).pack(anchor="w")
+        ttk.Label(title_frame, text=f"Version: {APP_VERSION}").pack(anchor="w", pady=(4, 0))
 
-    # ------------------------------------------------------------------
-    # Utility actions
-    # ------------------------------------------------------------------
-
-    def _open_folder(self, folder: Path) -> None:
-        """Open a folder using the operating system's default file browser."""
-
-        try:
-            folder.mkdir(parents=True, exist_ok=True)
-            system = platform.system().lower()
-            if system == "windows":
-                os.startfile(str(folder))  # type: ignore[attr-defined]
-            elif system == "darwin":
-                subprocess.run(["open", str(folder)], check=False)
-            else:
-                subprocess.run(["xdg-open", str(folder)], check=False)
-        except Exception as exc:
-            self._log(f"Could not open folder: {exc}")
+        ttk.Label(frame, text=f"Author: {APP_AUTHOR}").pack(anchor="w", pady=(10, 0))
+        ttk.Label(frame, text=f"License: {APP_LICENSE}").pack(anchor="w", pady=(6, 0))
+        ttk.Label(frame, text=f"Config: {config_path()}", wraplength=460).pack(anchor="w", pady=(8, 0))
+        link = ttk.Label(frame, text=APP_GITHUB, foreground="blue", cursor="hand2")
+        link.pack(anchor="w", pady=(8, 0))
+        link.bind("<Button-1>", lambda _event: webbrowser.open(APP_GITHUB))
+        ttk.Button(frame, text="Close", command=window.destroy).pack(anchor="e", pady=(14, 0))
 
     def _log(self, message: str) -> None:
-        """Write a line to the GUI log box."""
-
-        self.log_box.insert("end", message + "\n")
-        self.log_box.see("end")
-        self.update_idletasks()
+        self.log_text.insert("end", message + "\n")
+        self.log_text.see("end")
 
     def _handle_error(self, exc: Exception) -> None:
-        """Log and display an error in a user-friendly way."""
-
-        if isinstance(exc, ET.ParseError):
-            msg = f"Could not read the XML file. XML parse error:\n{exc}"
-        else:
-            msg = str(exc)
-
-        self._log("ERROR: " + msg)
-        self._log(traceback.format_exc())
-        messagebox.showerror("Error", msg)
+        error_text = "".join(traceback.format_exception_only(type(exc), exc)).strip()
+        self._log("ERROR: " + error_text)
+        messagebox.showerror("Error", error_text)
 
 
 # -----------------------------------------------------------------------------
 # Entry point
 # -----------------------------------------------------------------------------
 
-def main() -> int:
-    """Start the GUI application."""
-
+def main() -> None:
+    set_windows_app_user_model_id()
     app = CognexXmlToolGui()
     app.mainloop()
-    return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

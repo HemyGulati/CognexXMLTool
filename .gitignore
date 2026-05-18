@@ -3,28 +3,32 @@ __pycache__/
 *.py[cod]
 *.pyo
 *.pyd
-*.egg-info/
-.venv/
-venv/
-env/
 
-# PyInstaller
+# Build outputs
 build/
 dist/
+installer_output/
 *.spec
 
-# Local app config
+# Local config and generated outputs
 cognex_xml_tool_config.json
-
-# Tool outputs
-output/*.csv
-output/*.txt
+output/
 matched_images/
-*.csv
-*.txt
 
-# OS/editor
-.DS_Store
-Thumbs.db
-.vscode/
-.idea/
+# Private Cognex/image data - do not commit production files
+*.xml
+*.csv
+*.bmp
+*.jpg
+*.jpeg
+*.png
+*.tif
+*.tiff
+
+# Keep project assets and examples
+!assets/
+!assets/cognex_xml_tool.ico
+!assets/cognex_xml_tool.png
+!screenshots/
+!screenshots/*.svg
+!cognex_xml_tool_config.example.json

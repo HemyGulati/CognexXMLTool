@@ -1,85 +1,136 @@
 # Cognex XML Tool
 
+**Version:** 1.1.0  
 **Author:** Hemy Gulati  
-**Version:** 1.0.0
+**GitHub:** https://github.com/HemyGulati/CognexXMLTool  
+**License:** MIT License
 
-Cognex XML Tool is a Windows-friendly GUI app for processing Cognex In-Sight TestRun XML summary files.
+Cognex XML Tool is a Windows-friendly GUI for combining Cognex XML image metadata with Cognex CSV runtime result data.
 
-The tool loads one or more Cognex XML files, detects all available test names, lets the user choose which tests and result conditions matter, then exports CSV/TXT outputs and can copy the matched images into a selected folder.
+The XML is used for image names, image paths, and image order. The CSV is used for the actual runtime inspection results.
 
----
+## Screenshot
 
-## Key features
+![Cognex XML Tool main window](screenshots/main_window.png)
 
-- Load one or more Cognex XML summary files.
-- Scrollable, resizable GUI layout for laptop screens and smaller displays.
-- Automatically detect image names and test names from the XML.
-- Choose any detected tests to include in the output CSV.
-- Choose the result of interest for each selected test, such as `Pass`, `Fail`, `(Any / output only)`, or `(Missing / blank)`.
-- Reorder selected tests to control CSV column order.
-- Export all selected test results to CSV.
-- Export only matched rows to a separate CSV.
-- Export a TXT file containing only the matched image paths.
-- Copy matched images into a selected folder using the generated TXT path list.
-- Auto-load the last saved config file on startup.
-- Manually save or load config files from the **Settings** panel.
 
----
+## Why this workflow exists
 
-## Output files
-
-By default, the tool creates:
-
-| File | Purpose |
-|---|---|
-| `selected_test_results.csv` | All images with the selected test result columns. |
-| `matched_results.csv` | Only images matching the selected result conditions. |
-| `matched_image_paths.txt` | One image path per line for matched images. |
-
-Example CSV:
-
-```csv
-image name,image path,Inspection A result,Inspection B result
-sample_image_0001.bmp,C:\ExampleImages\sample_image_0001.bmp,Pass,Fail
-```
-
-Example TXT:
+Some Cognex XML exports contain expected results rather than actual runtime results. For result review and image sorting, the more reliable workflow is:
 
 ```text
-C:\ExampleImages\sample_image_0001.bmp
-C:\ExampleImages\sample_image_0042.bmp
+XML = image names / image paths / image order
+CSV = actual runtime results
 ```
 
----
+The tool merges both files internally, lets the user choose result conditions, previews the matched count, and creates filtered CSV/TXT outputs.
 
-## How to use the GUI
+## Features
 
-The main workflow window is scrollable. If your screen is smaller or Windows display scaling hides the lower sections, use the vertical scrollbar or mouse wheel to reach **Run and copy** and **Log**.
+- Load one or more Cognex XML files.
+- Load a Cognex CSV actual result file.
+- Automatically detect CSV result columns such as:
+  - `InspectionAPass`
+  - `InspectionBPass`
+  - `OverallPass`
+- Convert common result values automatically:
+  - `1`, `true`, `PASS`, `OK` → `Pass`
+  - `0`, `false`, `FAIL`, `NG` → `Fail`
+- Merge CSV rows to XML image names using:
+  - an image name/path column if available, or
+  - a `Record`/index column mapped to XML image order, or
+  - CSV row order fallback.
+- Select which result columns to include in the output.
+- Choose result conditions such as `Pass`, `Fail`, or output-only.
+- Reorder selected result columns before exporting.
+- Preview matched image count before generating outputs.
+- Generate:
+  - `selected_test_results.csv`
+  - `matched_results.csv`
+  - `matched_image_paths.txt`
+- Automatically creates a result-specific output folder for each run.
+- Defaults the output base folder to the folder containing the selected CSV file.
+- Names each run folder using the selected test names and result conditions.
+- Defaults copied/moved images to an `images` folder inside the run output folder.
+- Copy or move matched images directly from the GUI.
+- Auto-save and auto-load the last used configuration.
+- Uses a stable Windows config location instead of saving config beside the EXE.
+- Includes an app icon for the GUI, About popup, EXE, Windows taskbar, and installer.
+- Scrollable GUI layout for smaller screens.
+- Build scripts included for creating a standalone Windows EXE and installer.
+
+## Example output structure
+
+If the selected CSV file is in:
+
+```text
+C:\Example\Cognex Runs\
+```
+
+and the selected conditions are:
+
+```text
+Inspection A = Pass
+Inspection B = Fail
+```
+
+then the tool creates a folder like:
+
+```text
+C:\Example\Cognex Runs\Inspection_A_Pass_AND_Inspection_B_Fail\
+```
+
+Inside that folder, the tool creates:
+
+```text
+selected_test_results.csv
+matched_results.csv
+matched_image_paths.txt
+images\
+```
+
+The `images` folder is used when the user clicks **Copy matched images** or **Move matched images**.
+
+## Basic workflow
 
 1. Open **Cognex XML Tool**.
-2. Click **Add XML(s)** and select one or more Cognex XML files.
-3. Click **Scan XML(s)**.
-4. Select a detected test name from the left table.
-5. Select the result of interest, such as `Pass`, `Fail`, or `(Any / output only)`.
-6. Click **Add to output/filter**.
-7. Repeat for any other tests you want to include.
-8. Use **Move up** / **Move down** to control the CSV column order.
-9. Choose the output folder.
-10. Optional: choose an **Image folder override** if the XML image paths are missing or point to the wrong location.
-11. Choose the **Match mode**.
-12. Click **▶ Run: create outputs**.
-13. Optional: choose a **Copy images to** folder.
-14. Click **Copy matched images** to copy only the matched images.
+2. Add the Cognex XML file that contains image names and image paths.
+3. Select the Cognex CSV file that contains the actual result values.
+4. The output base folder will default to the CSV file folder.
+5. Click **Scan XML + CSV**.
+6. Select a detected CSV result column.
+7. Choose the result of interest, for example `Pass` or `Fail`.
+8. Click **Add to output/filter**.
+9. Repeat for any other tests/results of interest.
+10. Click **Preview matched count** to check how many images match.
+11. Click **Run: create outputs**.
+12. Click **Copy matched images** or **Move matched images** if required.
 
----
+## Config location
 
-## Match mode explained
+The app no longer saves the default config beside the EXE.
 
-Hover over **Match mode ⓘ** in the app to see this explanation.
+On Windows, the default config is saved here:
+
+```text
+%APPDATA%\CognexXMLTool\cognex_xml_tool_config.json
+```
+
+Example:
+
+```text
+C:\Users\<YourName>\AppData\Roaming\CognexXMLTool\cognex_xml_tool_config.json
+```
+
+This is intentional because installed applications normally live under `Program Files`, which standard users often cannot write to. Using `AppData` keeps the installer clean and prevents config files from appearing in random folders such as Downloads or the EXE build folder.
+
+If an old config exists beside the EXE from an earlier portable build, the app will try to migrate it into the new AppData location automatically.
+
+## Match modes
 
 ### ALL selected result conditions
 
-Use this when the image must meet every selected filter.
+The image must match every selected filter condition.
 
 Example:
 
@@ -87,179 +138,111 @@ Example:
 Inspection A = Pass AND Inspection B = Fail
 ```
 
-Only images where Inspection A is `Pass` and Inspection B is `Fail` will be included in `matched_results.csv` and `matched_image_paths.txt`.
-
 ### ANY selected result condition
 
-Use this when the image can meet at least one selected filter.
+The image only needs to match one selected filter condition.
 
 Example:
 
 ```text
-Inspection B = Fail OR Label Check = Fail OR Measurement = Fail
+Inspection A = Fail OR Inspection B = Fail OR Inspection C = Fail
 ```
 
-This is useful when you want one combined list of images that failed any one of several inspections.
+## Output files
 
-### `(Any / output only)`
+### selected_test_results.csv
 
-Use this when you want the test included as a CSV column, but you do not want it to filter the matched image list.
+Contains all merged image rows and the selected result columns.
 
-Example:
+### matched_results.csv
 
-| Test | Result of interest |
-|---|---|
-| Inspection A | Pass |
-| Inspection B | Fail |
-| Overall | `(Any / output only)` |
+Contains only the image rows that match the selected result conditions.
 
-This filters on Inspection A and Inspection B, but still includes Overall in the CSV for context.
+### matched_image_paths.txt
 
----
+Contains one image path per matched image. This can be used by the GUI copy/move buttons or by command-line tools.
 
-## Saved config file
+## Build the Windows EXE
 
-The app automatically looks for this file on startup:
+Install Python first, then run:
 
-```text
-cognex_xml_tool_config.json
-```
-
-When running from Python, the config file is saved beside:
-
-```text
-cognex_xml_tool.py
-```
-
-When running as a packaged EXE, the config file is saved beside:
-
-```text
-Cognex XML Tool.exe
-```
-
-The config stores:
-
-- output folder
-- image folder override
-- copy destination folder
-- output filenames
-- match mode
-- selected tests and their result filters
-
-The app saves the config when you click **Save config**, when you process outputs, and when you close the app. You can also manually load a different config file using **Load config** under **Settings**.
-
-A template is included:
-
-```text
-cognex_xml_tool_config.example.json
-```
-
----
-
-## Image folder override
-
-Use **Image folder override** when the XML contains image names but the stored paths are missing, old, or pointing to another PC.
-
-For example, if the XML image is:
-
-```text
-sample_image_0001.bmp
-```
-
-and the image folder override is:
-
-```text
-C:\ExampleImages\Run_01
-```
-
-then the TXT output will contain:
-
-```text
-C:\ExampleImages\Run_01\sample_image_0001.bmp
-```
-
----
-
-## Copy behaviour
-
-The **Copy matched images** button reads the generated `matched_image_paths.txt` file and copies those images into the selected folder.
-
-If two source images have the same filename, the tool avoids overwriting by adding a suffix:
-
-```text
-image.bmp
-image_copy1.bmp
-image_copy2.bmp
-```
-
-Missing source images are counted and shown in the log instead of stopping the full copy operation.
-
----
-
-## Run from Python
-
-Requirements:
-
-- Python 3.10 or newer recommended.
-- Tkinter, which is normally included with Python on Windows.
-
-Run:
-
-```powershell
-python cognex_xml_tool.py
-```
-
----
-
-## Build a standalone Windows EXE
-
-1. Install Python 3.10 or newer.
-2. Make sure Python is added to PATH.
-3. Double-click:
-
-```text
+```bat
 build_exe.bat
 ```
 
-The standalone EXE will be created here:
+The executable will be created at:
 
 ```text
 dist\Cognex XML Tool.exe
 ```
 
-You can then copy that EXE to another Windows PC and run it without opening Python manually.
+The build script uses PyInstaller and includes the app icon automatically.
 
----
+## Build the Windows installer
 
-## Repository structure
+The installer is built using **Inno Setup 6**.
 
-```text
-CognexXMLTool/
-├─ cognex_xml_tool.py
-├─ build_exe.bat
-├─ cognex_xml_tool_config.example.json
-├─ requirements.txt
-├─ requirements-dev.txt
-├─ README.md
-├─ LICENSE_NOTE.md
-├─ .gitignore
-└─ output/
+1. Install Inno Setup 6 from the official Inno Setup website.
+2. Run:
+
+```bat
+build_installer.bat
 ```
 
----
+The script will:
 
-## Notes on Cognex XML structure
+1. Build the standalone EXE using PyInstaller.
+2. Build the Windows installer using Inno Setup.
 
-The parser is designed around Cognex TestRun-style XML summary files where:
+The installer will be created in:
 
-- Each image is stored under a `ValidationFolder` element.
-- The `ValidationFolder` name is the image filename.
-- Test results are stored under child `Validate` elements.
-- Result values may be stored under tags such as `ExpectedResult`, `ActualResult`, `Result`, `Status`, `Actual`, or `Outcome`.
-- Image paths may be stored under tags such as `RefPath`, `Path`, `ImagePath`, or `FilePath`.
+```text
+installer_output\
+```
 
----
+The installer installs the app to:
 
-## Development notes
+```text
+C:\Program Files\Cognex XML Tool\
+```
 
-The GUI is built with Tkinter and packaged with PyInstaller.
+It also creates a Start Menu shortcut and can optionally create a Desktop shortcut.
+
+## Run from Python
+
+```bat
+run_gui_from_python.bat
+```
+
+or:
+
+```bat
+python cognex_xml_tool.py
+```
+
+## Notes
+
+This tool is intended for offline result analysis and image sorting from Cognex XML/CSV exports. It does not modify the Cognex job or communicate with the Cognex system.
+
+
+## Windows taskbar icon
+
+The packaged EXE uses the app icon through PyInstaller. The source also sets a Windows AppUserModelID so the taskbar icon is more reliable when running the app directly from Python.
+
+## License
+
+This project is released under the MIT License. See [`LICENSE`](LICENSE) for details.
+
+## Installer troubleshooting
+
+If `build_installer.bat` finds Inno Setup but no installer appears, scroll up in the terminal and check the compiler error. The installer output should be created in:
+
+```text
+installer_output\
+```
+
+The build script now creates that folder before running Inno Setup and passes the output folder directly to the compiler. The Inno Setup compiler is detected from common locations, including:
+
+```text
+%LocalAppData%\Programs\Inno Setup 6\ISCC.exe
+```
