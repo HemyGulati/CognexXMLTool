@@ -341,7 +341,6 @@ CognexXMLTool/
 ├─ build_exe.bat
 ├─ build_installer.bat
 ├─ LICENSE
-├─ LICENSE.txt
 ├─ README.md
 ├─ CHANGELOG.md
 ├─ requirements.txt
