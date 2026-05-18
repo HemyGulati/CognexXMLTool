@@ -30,5 +30,5 @@ matched_images/
 !assets/cognex_xml_tool.ico
 !assets/cognex_xml_tool.png
 !screenshots/
-!screenshots/*.svg
+!screenshots/*.png
 !cognex_xml_tool_config.example.json
