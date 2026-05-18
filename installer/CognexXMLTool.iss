@@ -16,7 +16,7 @@ AppCopyright=Copyright (c) 2026 Hemy Gulati
 DefaultDirName={autopf}\Cognex XML Tool
 DefaultGroupName=Cognex XML Tool
 DisableProgramGroupPage=yes
-LicenseFile=..\LICENSE.txt
+LicenseFile=..\LICENSE
 OutputDir=..\installer_output
 OutputBaseFilename=CognexXMLTool_Setup_v{#MyAppVersion}
 SetupIconFile=..\assets\cognex_xml_tool.ico
@@ -38,7 +38,6 @@ Source: "..\dist\Cognex XML Tool.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\CHANGELOG.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\LICENSE.txt"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\cognex_xml_tool_config.example.json"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\assets\cognex_xml_tool.ico"; DestDir: "{app}\assets"; Flags: ignoreversion
 Source: "..\assets\cognex_xml_tool.png"; DestDir: "{app}\assets"; Flags: ignoreversion
